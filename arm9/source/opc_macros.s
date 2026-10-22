@@ -805,17 +805,20 @@ GNU General Public License for more details.
             TranslateAddress    0
         .endif
         
+        @--- Direct-page fast path ------------------------------------------
+        @ DP / DPIndexedX / DPIndexedY resolve to a bank-$00 address
+        @ (D + operand [+X/Y]). Those blocks are mirrored in the ITCM DPCache
+        @ (MAP[0..0x1F]); using it removes the uncached VRAM MAP load that is
+        @ the hottest memory-translation cost on ARM946E-S. Register usage is
+        @ identical to TranslateAddress (r1/r2 scratch), so no clobber change.
         .ifc \addrMode, DP
-            @TranslateAddressFromDPCache
-            TranslateAddress	0            
+            TranslateAddressFromDPCache
         .endif
         .ifc \addrMode, DPIndexedX
-            @TranslateAddressFromDPCache
-            TranslateAddress	0            
+            TranslateAddressFromDPCache
         .endif
         .ifc \addrMode, DPIndexedY
-            @TranslateAddressFromDPCache
-            TranslateAddress	0            
+            TranslateAddressFromDPCache
         .endif
 
         .ifc \addrMode, DPIndirect

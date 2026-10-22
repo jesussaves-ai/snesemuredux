@@ -2,6 +2,7 @@
 #include "spcdefs.h"
 #include "apu.h"
 #include "dsp.h"
+#include "dsp_declick.h"
 #include "main.h"
 #include "InterruptsARMCores_h.h"
 #include "interrupts.h"
@@ -25,6 +26,7 @@ int PocketSPCVersion = 0; //9 = pocketspcv0.9 / 10 = pocketspcv1.0
 
 void SetupSoundSPC() {
     soundCursor = 0;
+    DspDeclickInit();   /* seed the DAC smoothing state */
 	SoundPowerON(127);		//volume
 
     TIMERXDATA(1) = TIMER_FREQ(MIXRATE);
@@ -51,6 +53,10 @@ void SetupSoundSPC() {
 }
  
 void StopSoundSPC() {
+    /* Ramp to silence over the next few panels before cutting the DAC so the
+     * stop itself does not pop.  The mix IRQ is still running here. */
+    DspDeclickRequestFade();
+    swiDelay(((0x10000 - SOUND_FREQ(MIXRATE)) * (MIXBUFSIZE * 9)) >> 2);
     powerOFF(POWER_SOUND);
     REG_SOUNDCNT = 0;
     TIMERXCNT(1) = 0;

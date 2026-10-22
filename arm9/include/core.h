@@ -91,6 +91,8 @@ extern int APU_MAX;
 extern uint32 keys;
 extern int	SPC700_emu;
 extern int	PPU_fastDMA_2118_1(int offs, int bank, int len);
+extern int	PPU_fastDMA_VRAM_0(int offs, int bank, int len, int port);
+extern int	PPU_fastDMA_2104(int offs, int bank, int len);
 extern void DMA_transfert(uchar port);
 extern void		HDMA_transfert(uint8 port);
 extern uint32	IONOP_DMA_READ(uint32 addr);

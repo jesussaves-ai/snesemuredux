@@ -1,0 +1,71 @@
+name: release
+
+# Builds the NTR (4MB) and TWL/DSi (16MB) targets, validates the ARM946E-S
+# linker bounds and publishes a packaged release with banner metadata,
+# configuration templates and a checksum manifest.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version string (e.g. 0.6d)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fish zip coreutils
+          # ndstool ships with devkitPro; install it if available.
+          if ! command -v ndstool >/dev/null 2>&1; then
+            echo "::warning::ndstool not found; banner repack will be skipped"
+          fi
+
+      - name: Verify ToolchainGenericDS SDK
+        run: |
+          if [ ! -f /usr/arm-none-eabi/lib/newlib-nano-2.1-nds/6.2_2016q4/Makefile.basenewlib ]; then
+            echo "::error::ToolchainGenericDS SDK not found."
+            echo "Install it at /usr/arm-none-eabi/lib/newlib-nano-2.1-nds/6.2_2016q4/ before packaging."
+            exit 1
+          fi
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=0.6d" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and package
+        run: fish scripts/release.fish --version "${{ steps.ver.outputs.version }}"
+
+      - name: Upload distribution directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: SNEmulDS-${{ steps.ver.outputs.version }}
+          path: dist/
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SNEmulDS-${{ steps.ver.outputs.version }}.zip
+            dist/SNEmulDS-${{ steps.ver.outputs.version }}/SHA256SUMS

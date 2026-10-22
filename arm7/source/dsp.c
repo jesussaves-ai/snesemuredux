@@ -7,6 +7,7 @@
 
 #include "spcdefs.h"
 #include "dsp.h"
+#include "dsp_declick.h"
 #include "apu.h"
 #include "ipcfifoTGDSUser.h"
 
@@ -83,6 +84,9 @@ uint32 DecodeSampleBlock(struct DspChannel *channel) {
 
 void DspReset() {
     int i = 0, c = 0;
+    /* A DSP reset is a hard step in the output: clear the de-click smoothing
+     * state so the first mixed panel is re-seeded cleanly. */
+    DspDeclickInit();
     // Delay for 1 sample
     echoDelay = 4;
     echoCursor = 0;
@@ -341,6 +345,9 @@ void DspKeyOnChannel(uint32 i) {
 
 void DspPrepareStateAfterReload() {
     int i = 0;
+    /* The APU state jumped (state reload / map transition): ramp the output to
+     * silence over the next few panels instead of stepping. */
+    DspDeclickRequestFade();
 	// Set up echo delay
     DspWriteByte(DSP_MEM[DSP_EDL], DSP_EDL);
 

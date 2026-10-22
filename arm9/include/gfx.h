@@ -94,6 +94,9 @@ struct s_gfx
   uint32	spr_bank;
 
   int		tiles_dirty;
+  int		mode7_dirty;      /* set on VRAM writes while Mode 7 is active */
+  int		mode7_last_slot;  /* tile slot used by the last Mode 7 VRAM copy */
+  int		mode7_copied;     /* 1 once the Mode 7 map/tiles have been copied */
 
   int		BG_scroll_reg;
   int		Graph_enabled;

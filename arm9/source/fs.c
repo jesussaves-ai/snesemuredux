@@ -58,6 +58,24 @@ GNU General Public License for more details.
 
 /* *********************** FAT ************************ */
 
+/* Shadow open-state for the global paging file descriptor.
+ * FS_loadROM / FS_loadROMForPaging open it, FS_loadROMPage keeps it open for
+ * the lifetime of the game, and mem_init_paging may close it from another
+ * translation unit. Routing every close through FS_closePagingFD() guarantees
+ * the FD is never double-closed and never left dangling. */
+static bool fPagingFD_open = false;
+
+void FS_closePagingFD(void){
+	if (fPagingFD_open){
+		f_close(&fPagingFD);
+		fPagingFD_open = false;
+	}
+}
+
+void FS_markPagingFDOpened(void){
+	fPagingFD_open = true;
+}
+
 #if (defined(__GNUC__) && !defined(__clang__))
 __attribute__((optimize("O0")))
 #endif
@@ -67,7 +85,7 @@ __attribute__ ((optnone))
 #endif
 int	FS_loadROM(sint8 *ROM, sint8 *filename){
 	FS_lock();
-	f_close(&fPagingFD);
+	FS_closePagingFD();
 	int flags = charPosixToFlagPosix("r");
 	BYTE mode = posixToFatfsAttrib(flags);
 	FRESULT result = f_open(&fPagingFD, (const TCHAR*)filename, mode);
@@ -77,6 +95,7 @@ int	FS_loadROM(sint8 *ROM, sint8 *filename){
 		while(1==1){}
 		return -1;
 	}
+	fPagingFD_open = true;
 	
 	//Prevent Cache problems.
 	f_lseek (
@@ -84,11 +103,16 @@ int	FS_loadROM(sint8 *ROM, sint8 *filename){
 			(DWORD)0       /* File offset in unit of byte */
 		);
 	int size = f_size(&fPagingFD);
-	int readSize;
+	int readSize = 0;
 	result = f_read(&fPagingFD, ROM, (int)size, (UINT*)&readSize);
 	coherent_user_range_by_size((uint32)ROM, (int)size); //Prevent Cache problems.
 	GUI_printf("Read done: %d bytes ", readSize);
-	f_close(&fPagingFD);
+	FS_closePagingFD();
+
+	if (result != FR_OK || readSize != size){
+		FS_unlock();
+		return -1;
+	}
 
 	FS_unlock();
 	return 1;
@@ -108,7 +132,7 @@ __attribute__ ((optnone))
 int	FS_loadROMForPaging(sint8 *ROM, sint8 *filename, int size)
 {
 	FS_lock();
-	f_close(&fPagingFD);
+	FS_closePagingFD();
 	
 	int flags = charPosixToFlagPosix("r");
 	BYTE mode = posixToFatfsAttrib(flags);
@@ -120,6 +144,7 @@ int	FS_loadROMForPaging(sint8 *ROM, sint8 *filename, int size)
 		while(1==1){}
 		return -1;
 	}
+	fPagingFD_open = true;
 	
 	//Prevent Cache problems.
 	f_lseek (
@@ -127,9 +152,14 @@ int	FS_loadROMForPaging(sint8 *ROM, sint8 *filename, int size)
 			(DWORD)0       /* File offset in unit of byte */
 		);
 
-	int ret;
+	int ret = 0;
 	result = f_read(&fPagingFD, ROM, (int)size, (UINT*)&ret);
-	if(ret != size){
+	if(result != FR_OK || ret != size){
+		/* Loading the paging window failed: release the FS lock and drop the
+		 * freshly opened handle so no locked FS / dangling FD is left behind.
+		 * On success the handle intentionally stays open for FS_loadROMPage. */
+		FS_closePagingFD();
+		FS_unlock();
 		return -1;
 	}
 
@@ -152,15 +182,27 @@ int	FS_loadROMPage(sint8 *buf, unsigned int pos, int size){
 	FRESULT ret;	
 	FS_lock();
 	
+	/* Nothing to read from if the paging handle was closed (e.g. a previous
+	 * load failure). Bail out without dereferencing a closed FIL. */
+	if (!fPagingFD_open){
+		FS_unlock();
+		return -1;
+	}
+
 	ret = f_lseek (
 			&fPagingFD,   /* Pointer to the file object structure */
 			(DWORD)pos       /* File offset in unit of byte */
 		);
+	if (ret != FR_OK)
+	{
+		FS_unlock();
+		return -1;
+	}
 
-	int readSize;
+	int readSize = 0;
 	ret = f_read(&fPagingFD, (u8*)buf, size, (UINT*)&readSize);
 
-	if (ret != FR_OK)
+	if (ret != FR_OK || readSize != size)
 	{
 		FS_unlock();
 		return -1;
@@ -169,6 +211,7 @@ int	FS_loadROMPage(sint8 *buf, unsigned int pos, int size){
 	//Prevent Cache problems.
 	coherent_user_range_by_size((uint32)buf, (int)size);
 	
+	FS_unlock();
 	return readSize;
 }
 
@@ -182,7 +225,7 @@ int	FS_shouldFreeROM()
 int	FS_loadFileFatFS(sint8 *filename, sint8 *buf, int size){
 	FS_lock();
 	FIL thisFD;
-	f_close(&thisFD);
+	memset(&thisFD, 0, sizeof(FIL));
 	int flags = charPosixToFlagPosix("r");
 	BYTE mode = posixToFatfsAttrib(flags);
 	FRESULT result = f_open(&thisFD, (const TCHAR*)filename, mode);
@@ -196,18 +239,24 @@ int	FS_loadFileFatFS(sint8 *filename, sint8 *buf, int size){
 			&thisFD,   /* Pointer to the file object structure */
 			(DWORD)0       /* File offset in unit of byte */
 		);
-	int readSize;
+	int readSize = 0;
 	result = f_read(&thisFD, buf, (int)size, (UINT*)&readSize);
 	coherent_user_range_by_size((uint32)buf, (int)size); //Prevent Cache problems.
 	f_close(&thisFD);
+
+	if (result != FR_OK || readSize != size){
+		FS_unlock();
+		return -1;
+	}
 
 	FS_unlock();
 	return 1;
 }
 
 int	FS_saveFileFatFS(sint8 *filename, sint8 *buf, int size,bool force_file_creation){
+	FS_lock();
 	FIL thisFD;
-	f_close(&thisFD);
+	memset(&thisFD, 0, sizeof(FIL));
 	char var[16];
 	if(force_file_creation == true){
 		sprintf((sint8*)var,"%s","w+");
@@ -230,22 +279,24 @@ int	FS_saveFileFatFS(sint8 *filename, sint8 *buf, int size,bool force_file_creat
 		);
 	
 	coherent_user_range_by_size((uint32)buf, (int)size); //Prevent Cache problems.
-	int writtenSize;
+	int writtenSize = 0;
 	result = f_write(&thisFD, buf, (int)size, (UINT*)&writtenSize);
 	//GUI_printf("Written: %d bytes ", readSize);
 	f_close(&thisFD);
 
-	if (result != FR_OK)
+	if (result != FR_OK || writtenSize != size)
 	{
 		FS_unlock();
 		return -1;
 	}
+	FS_unlock();
 	return 0;
 }
 
 int	FS_getFileSizeFatFS(sint8 *filename){
+	FS_lock();
 	FIL thisFD;
-	f_close(&thisFD);
+	memset(&thisFD, 0, sizeof(FIL));
 	int flags = charPosixToFlagPosix("r");
 	BYTE mode = posixToFatfsAttrib(flags);
 	FRESULT result = f_open(&thisFD, (const TCHAR*)filename, mode);
@@ -255,6 +306,7 @@ int	FS_getFileSizeFatFS(sint8 *filename){
 	}
 	int size = f_size(&thisFD);
 	f_close(&thisFD);
+	FS_unlock();
 	return size;
 }
 

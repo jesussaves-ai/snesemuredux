@@ -51,6 +51,7 @@ struct s_cfg
   int	YScroll;
   int	WaitVBlank; //[VBlank disabled]: CFG.WaitVBlank == 0; / [VBlank fast]: CFG.WaitVBlank = 1; / [VBlank full]: CFG.WaitVBlank = 2;
   bool	LargeROM;
+  int	Mode0Fix; //1 = use the dedicated 4-layer 2bpp Mode 0 renderer
   
   uint32	LayersConf;  
   uint8		LayerPr[4];
@@ -60,6 +61,7 @@ struct s_cfg
   
   uint32	Transparency;
   uint32	FastDMA;
+  int	Bilinear; //1 = enable the vertical-scale bi-linear dithering (line flag 0x40)
   
   uint16	MouseXAddr;
   uint16	MouseYAddr;

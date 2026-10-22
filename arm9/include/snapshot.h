@@ -20,9 +20,28 @@ GNU General Public License for more details.
 
 #include "guiTGDS.h"
 
+/* Version tag stored in TSnapShot.options[0]. Bump when the packed option
+ * layout changes so read_snapshot() can refuse to unpack unknown layouts. */
+#define SNAPSHOT_OPTIONS_VERSION 2
+
+/* v3 file-format version (stored in TSnapShot_V3Header.version). */
+#define SNAPSHOT_V3_VERSION 3
+
 typedef struct {
   char name[16];
 } TSnapShot_Header;
+
+/* v3 envelope written immediately after the name. The 4-byte magic lets a
+ * reader distinguish a v3 file from a legacy v1/v2 file (whose bytes 16..31
+ * are the first 16 bytes of WRAM) without seeking. checksum is CRC32 over the
+ * payload_len bytes that follow. flags bit0 = SPC payload present. */
+typedef struct {
+  unsigned char magic[4];   /* 'S','N','E','3' */
+  uint16        version;    /* SNAPSHOT_V3_VERSION */
+  uint16        flags;      /* bit0: SPC payload present */
+  uint32        payload_len;
+  uint32        checksum;   /* CRC32 of the payload */
+} TSnapShot_V3Header;
 
 typedef struct {
   int            A, X, Y, S, P, D, PB, DB, PC;

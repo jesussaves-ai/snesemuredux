@@ -6,6 +6,7 @@
 #include "spcdefs.h"
 #include "apu.h"
 #include "dsp.h"
+#include "dsp_declick.h"
 #include "main.h"
 #include "apu_shared.h"
 #include "spifwTGDS.h"
@@ -41,6 +42,11 @@ void Timer1handlerUser(){
 
 static int apuMixPosition = 0;
 
+/* Samples already handed to the Direct Sound hardware but not yet consumed.
+ * Used to implement a level-triggered refill: we only re-arm a hardware
+ * channel once the previously queued panel has fully drained. */
+static int dsoundSamplesQueued = 0;
+
 #ifdef ARM9
 __attribute__((section(".itcm")))
 #endif
@@ -55,22 +61,34 @@ void Timer2handlerUser(){
 		soundCursor = MIXBUFSIZE - soundCursor;
 		s16 * leftOutputChannel = (s16 *)&(playBuffer[MIXBUFSIZE - soundCursor]);
 		s16 * rightOutputChannel = leftOutputChannel + (MIXBUFSIZE << 1);
-		
-		// Left channel
-		int channel = soundCursor == 0 ? 0 : 1;
-		SCHANNEL_TIMER(channel) = SOUND_FREQ(MIXRATE);
-		SCHANNEL_SOURCE(channel) = (uint32)leftOutputChannel;
-		SCHANNEL_LENGTH(channel) = (MIXBUFSIZE) >> 1;
-		SCHANNEL_REPEAT_POINT(channel) = 0;
-		SCHANNEL_CR(channel) = SCHANNEL_ENABLE | SOUND_ONE_SHOT | SOUND_VOL(0x7F) | SOUND_PAN(0) | SOUND_16BIT;
 
-		// Right channel
-		channel = soundCursor == 0 ? 2 : 3;
-		SCHANNEL_TIMER(channel) = SOUND_FREQ(MIXRATE);
-		SCHANNEL_SOURCE(channel) = (uint32)rightOutputChannel;
-		SCHANNEL_LENGTH(channel) = (MIXBUFSIZE) >> 1;
-		SCHANNEL_REPEAT_POINT(channel) = 0;
-		SCHANNEL_CR(channel) = SCHANNEL_ENABLE | SOUND_ONE_SHOT | SOUND_VOL(0x7F) | SOUND_PAN(0x7F) | SOUND_16BIT;
+		/* Level-triggered refill: a timer tick drains exactly one panel
+		 * (MIXBUFSIZE samples), so decrement the outstanding count and only
+		 * re-arm the channels when it has reached zero.  If the IRQ arrives
+		 * early the count is still positive and we deliberately leave the
+		 * currently playing channel alone - restarting it mid-panel is one of
+		 * the main sources of the Direct Sound "pop". */
+		dsoundSamplesQueued -= MIXBUFSIZE;
+		if (dsoundSamplesQueued <= 0){
+			// Left channel
+			int channel = soundCursor == 0 ? 0 : 1;
+			SCHANNEL_TIMER(channel) = SOUND_FREQ(MIXRATE);
+			SCHANNEL_SOURCE(channel) = (uint32)leftOutputChannel;
+			SCHANNEL_LENGTH(channel) = (MIXBUFSIZE) >> 1;
+			SCHANNEL_REPEAT_POINT(channel) = 0;
+			SCHANNEL_CR(channel) = SCHANNEL_ENABLE | SOUND_ONE_SHOT | SOUND_VOL(0x7F) | SOUND_PAN(0) | SOUND_16BIT;
+
+			// Right channel
+			channel = soundCursor == 0 ? 2 : 3;
+			SCHANNEL_TIMER(channel) = SOUND_FREQ(MIXRATE);
+			SCHANNEL_SOURCE(channel) = (uint32)rightOutputChannel;
+			SCHANNEL_LENGTH(channel) = (MIXBUFSIZE) >> 1;
+			SCHANNEL_REPEAT_POINT(channel) = 0;
+			SCHANNEL_CR(channel) = SCHANNEL_ENABLE | SOUND_ONE_SHOT | SOUND_VOL(0x7F) | SOUND_PAN(0x7F) | SOUND_16BIT;
+
+			/* Refilled: this panel will be consumed over the next tick. */
+			dsoundSamplesQueued = MIXBUFSIZE;
+		}
 
 		int samplesToMix = MIXBUFSIZE;
 		DspMixSamplesStereo(samplesToMix, &playBuffer[soundCursor]);
@@ -82,7 +100,12 @@ void Timer2handlerUser(){
 			samplesToMix = MIXBUFSIZE;
 			apuMixPosition = 0;
 		}
-		apuMixPosition += samplesToMix;	
+		apuMixPosition += samplesToMix;
+
+		/* De-click the panel the hardware will pick up on the next tick
+		 * (it re-arms from this half).  Bounded, integer-only smoothing. */
+		DspDeclickPanel(&playBuffer[soundCursor], MIXBUFSIZE);
+
 		ApuUpdateTimers(sampleRateDivider);	//Coto: New timer code will synchronize to NDS timer ticks. Will require several patches per game to adjust the correct samplerate for each one.
 	}	
 }

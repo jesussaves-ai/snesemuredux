@@ -147,6 +147,18 @@ $(EXECUTABLE_FNAME)	:	compile
 	-mv $(TGDSPROJECTNAME).nds	$(CURDIR)/release/arm7dldi-ntr
 	-mv $(TGDSPROJECTNAME).srl	$(CURDIR)/release/arm7dldi-twl
 	-@echo 'ndstool end: built: $@'
+
+#---------------------------------------------------------------------------------
+# Release packaging: assemble a distribution bundle (binaries + banner metadata
+# refresh + config templates + SHA256 manifest + zip) via scripts/release.fish.
+# The script re-validates the ARM946E-S linker bounds and the 4MB NTR EWRAM
+# window from the build artefacts.
+release: $(EXECUTABLE_FNAME)
+	-@echo 'Packaging release...'
+	fish scripts/release.fish
+
+dist: release
+	-@echo 'Distribution ready in dist/'
 	
 #---------------------------------------------------------------------------------
 # Clean

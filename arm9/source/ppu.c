@@ -38,6 +38,41 @@ uint32 bittab[256];
 //__attribute__((section(".dtcm")))
 uint32 bittab8[16];
 
+/* Per-line register-write cache. The HBLANK handler reprograms DISPCNT,
+ * BG0..BG3 control, BG0..BG3 scroll and BLEND for every visible line, but
+ * adjacent scanlines are almost always identical. Cache the last values
+ * written to the DS so identical groups are skipped. Invalidated whenever a
+ * non-normal line (blank / sprite-bank / Mode 7) writes these registers
+ * outside this path, and on PPU_reset(). */
+static unsigned char s_lineCacheValid = 0;
+static uint32 s_lastDISPCNT = 0, s_lastBLEND = 0, s_lastBACK = 0;
+static uint32 s_lastCR0 = 0, s_lastCR1 = 0;
+static uint32 s_lastSCR0 = 0, s_lastSCR1 = 0, s_lastSCR2 = 0, s_lastSCR3 = 0;
+
+/* Map a SNES source scanline to its destination DS line under the active
+ * scaling mode. The hardware scaling is emulated by stepping the BG vertical
+ * scroll by one pixel every `per_px` lines, so the background samples source
+ * line  src = dest + floor(dest/per_px) + offset.  The exact inverse is
+ *      dest = u - floor(u/(per_px+1)),   u = src - offset
+ * Using it (instead of the old truncated u*192/208 form) keeps sprites and the
+ * background sampling phase-aligned and removes the per-line vertical jitter
+ * (the old form was off by one on almost every line). */
+static inline int PPU_scaledLine(int srcY)
+{
+	int u;
+	if (CFG.Scaled == 1) {          /* half scale: 208 src -> 192 (offset 8) */
+		u = srcY - 8;
+		if (u < 0) return -1;
+		u -= u / 13;
+	} else {                        /* full screen: 224 src -> 192 */
+		u = srcY;
+		if (u < 0) return -1;
+		u -= u / 7;
+	}
+	if (u > 191) u = 191;
+	return u;
+}
+
 void    init_render()
 {
   int  PixelOdd = 1;
@@ -127,6 +162,11 @@ uint16		ToUpdate4b[100];
 
 int	PPU_get_bgmode(int mode, int bg)
 {
+  /* Mode 0: all four BG layers are 2bpp (16 colours). Without this the
+   * tile-zone allocation in PPU_add_tile_address() is skipped for SNES BG2
+   * and BG4, which is what broke Mode 0 rendering. */
+  if (mode == 0)
+    return 2;
   if (bg == 0)
   {
   	if (mode == 1 || mode == 2 || mode == 5 || mode == 6)
@@ -375,6 +415,15 @@ void     add_tile_4(int tile_addr_base, uint16 *vram_addr, int tilenb)
 }
 
 
+/* P6 (audit): add_tile_8 is a hot per-tile converter but is deliberately kept
+ * in EWRAM, not .itcm.  Measured size is ~380 bytes (arm-none-eabi-gcc -O3,
+ * arm946e-s); the 32 KB ITCM window is already shared by 86 ARM9 register
+ * handlers plus the IRQ entry points, and its total footprint could not be
+ * re-measured here (TGDS SDK/map file absent), so the 1 KB safety margin the
+ * audit requires cannot be guaranteed.  It is therefore compiled -O3 here. */
+#if (defined(__GNUC__) && !defined(__clang__))
+__attribute__((optimize("O3")))
+#endif
 void     add_tile_8(int tile_addr_base, uint16 *vram_addr, int tilenb)
 {
   int		a;
@@ -484,6 +533,10 @@ int		PPU_AddTile4InCache(t_TileZone *tilezone, int addr)
 __attribute__((section(".itcm")))
 void check_tile()
 {
+  /* Mode 7 bypasses the tile-zone cache entirely (renderMode7 does a direct
+   * VRAM->DS copy). Flag the copy dirty and skip the useless cache work. */
+  if ((PPU_PORT[0x05]&7) == 7) { GFX.mode7_dirty = 1; return; }
+
   int		addr = (PPU_PORT[0x16]<<1)&0xFFFF;
   GFX.map_def[addr/2048] = 0;
   // Check tile zone
@@ -604,7 +657,7 @@ void	PPU_setMap(int i, int j, int tilenb, int bg, int p, int f)
 {
   uint16 *map_addr = GFX.DSMapAddress;
   
-  if (bg == 2)
+  if (bg == 2 || (PPU_PORT[0x05]&7) == 0) /* 2bpp layers: mode 1 BG3, all of mode 0 */
   {
 /*  if ((PPU_PORT[0x05]&7) == 0)
   	p += bg*2;*/
@@ -694,8 +747,16 @@ void	draw_plane(int bg, int bg_mode, int nb_tilex, int nb_tiley, int tile_size)
   uint8		*tiles_def = NULL;
   void	 	(*add_tile)(int tilebase, uint16 *vram_addr, int tilenb) = NULL;
   int 		tile_zone = (GFX.tile_address[bg]>>13);
+  int		mode0 = ((PPU_PORT[0x05]&7) == 0); /* Mode 0: all four BGs are 2bpp */
 	
   map_address  = GFX.map_slot[bg]<<11;
+  /* Keep the tilemap base inside the 64 KB SNESC.VRAM allocation. The SNES
+   * 5-bit base is a 0x800-byte block (max 0xF800) and the largest tilemap we
+   * read (64x64) is 0x2000 bytes, so clamp only bases that cannot fit; this
+   * prevents an out-of-bounds read past the VRAM heap block for corrupt or
+   * extended map bases. */
+  if (map_address > (0x10000 - 0x2000))
+  	map_address &= 0x7FFF;
   GFX.DSMapAddress = (uint16 *)BG_MAP_RAM(GFX.map_slot_ds[bg]);
   
   switch (bg_mode) {
@@ -756,8 +817,9 @@ void	draw_plane(int bg, int bg_mode, int nb_tilex, int nb_tiley, int tile_size)
   			else
   				GFX.BG3TilePriority[i/32]--;
   			}
-  			p += 8; // FIXME: this should be made for all 2 colors bg
   		}
+  		if (bg == 2 || mode0)
+  			p += 8; // 2bpp palettes live in BG_PALETTE[128...] (modes 0/1)
   		tilenb &= 0x3ff;
 
   		if (!tiles_def[tilenb])
@@ -777,8 +839,8 @@ void	draw_plane(int bg, int bg_mode, int nb_tilex, int nb_tiley, int tile_size)
   		{ 		
   			add_tile(GFX.tile_address[bg], vram_addr, tilenb);
   		}
-  		if (bg == 2)
-  			p += 8; // FIXME: 2 colors palette
+  		if (bg == 2 || mode0)
+  			p += 8; // 2bpp palettes live in BG_PALETTE[128...] (modes 0/1)
   		GFX.DSMapAddress[i] = (p << 12)|(f << 10)|tilenb;
   	}
   	}
@@ -798,8 +860,9 @@ void	draw_plane(int bg, int bg_mode, int nb_tilex, int nb_tiley, int tile_size)
   			else
   				GFX.BG3TilePriority[i/32]--;
   			}
-  			p += 8; // FIXME: this should be made for all 2 colors bg
   		}
+  		if (bg == 2 || mode0)
+  			p += 8; // 2bpp palettes live in BG_PALETTE[128...] (modes 0/1)
         tilenb &= 0x3ff;  		
   		if (!tiles_def[tilenb])
   			add_tile(GFX.tile_address[bg], vram_addr, tilenb);
@@ -823,8 +886,9 @@ void	draw_plane(int bg, int bg_mode, int nb_tilex, int nb_tiley, int tile_size)
   			else
   				GFX.BG3TilePriority[i/32]--;
   			}
-  			p += 8; // FIXME: this should be made for all 2 colors bg
-  		}  			
+  		}
+  		if (bg == 2 || mode0)
+  			p += 8; // 2bpp palettes live in BG_PALETTE[128...] (modes 0/1)  			
         tilenb &= 0x3ff;   		
   		if (!tiles_def[tilenb])
   			add_tile(GFX.tile_address[bg], vram_addr, tilenb);
@@ -900,6 +964,13 @@ void	draw_plane_withpriority(int bg, int bg_mode, int nb_tilex, int nb_tiley, in
   int 		tile_zone = (GFX.tile_address[bg]>>13);
 	
   map_address  = GFX.map_slot[bg]<<11;
+  /* Keep the tilemap base inside the 64 KB SNESC.VRAM allocation. The SNES
+   * 5-bit base is a 0x800-byte block (max 0xF800) and the largest tilemap we
+   * read (64x64) is 0x2000 bytes, so clamp only bases that cannot fit; this
+   * prevents an out-of-bounds read past the VRAM heap block for corrupt or
+   * extended map bases. */
+  if (map_address > (0x10000 - 0x2000))
+  	map_address &= 0x7FFF;
   ds_map_ptr1 = (uint16 *)BG_MAP_RAM(GFX.map_slot_ds[bg]); // main layer for high priority tile
   ds_map_ptr2 = (uint16 *)BG_MAP_RAM(GFX.map_slot_ds[3]); // back layer for low priority tile
   
@@ -945,7 +1016,9 @@ void	draw_plane_withpriority(int bg, int bg_mode, int nb_tilex, int nb_tiley, in
   	/* 8 px tile mode */
   	map_ptr = (uint16 *)(SNESC.VRAM+map_address);
 
-  	for (i = nb_tilex*nb_tiley; i >= 0; i--)
+  	/* Iterate exactly nb_tilex*nb_tiley tiles (the old bound ran one extra
+  	 * iteration and read/wrote map_ptr[nb_tilex*nb_tiley]). */
+  	for (i = nb_tilex*nb_tiley - 1; i >= 0; i--)
   	{
   		tilenb = map_ptr[i];
   		p = (tilenb&0x1c00) >> 10; f = (tilenb&0xc000) >> 14;
@@ -1253,8 +1326,6 @@ void draw_sprites(/*unsigned char pf*/)
 	else
 		i = GFX.HighestSprite-1;
 
-	((uint32 *)&sprite)[0] = 0;
-	((uint32 *)&sprite)[1] = 0;
 	while (1)
 	{
 		if ((GFX.spr_info[i].pos_y < 224 || GFX.spr_info[i].pos_y > 240) &&
@@ -1262,6 +1333,13 @@ void draw_sprites(/*unsigned char pf*/)
 		 /*(GFX.spr_info[i].pos_x || GFX.spr_info[i].pos_y || GFX.spr_info[i].fst_tile
 		 || GFX.spr_info[i].palette || GFX.spr_info[i].flip))*/
 		{
+			/* Clear the entire OAM entry for *this* sprite every iteration so
+			 * rot_data / rot_data2 / flip / mode never carry over from the
+			 * previous sprite (the struct used to be zeroed only once, before
+			 * the loop, which let a full-scaling affine flag leak into a
+			 * non-affine sprite). */
+			((uint32 *)&sprite)[0] = 0;
+			((uint32 *)&sprite)[1] = 0;
 			sprite.X = GFX.spr_info[i].pos_x+SPRITE_ADD_X(i);
 			if (CFG.Scaled)
 			{
@@ -1269,12 +1347,12 @@ void draw_sprites(/*unsigned char pf*/)
 				{
 					sprite.rot_data = 1;
 					sprite.rot_data2 = GFX.spr_info[i].flip;					
-					sprite.Y = GFX.spr_info[i].pos_y*192/224; // doesn't seem okay
+					sprite.Y = PPU_scaledLine(GFX.spr_info[i].pos_y);
 				}
 				else // Half scaling : no sprite squishing
 				{
 					sprite.flip = GFX.spr_info[i].flip;
-					sprite.Y = (GFX.spr_info[i].pos_y-8)*192/208; // doesn't seem okay
+					sprite.Y = PPU_scaledLine(GFX.spr_info[i].pos_y);
 				}
 			}
 			else
@@ -1399,45 +1477,56 @@ void draw_sprites(/*unsigned char pf*/)
 			i = 127;
 	}
 	
-	// Set scaling matrix
+	/* ---- Rotation/scaling matrices (only meaningful when sprites are affine)
+	 * ----
+	 * Matrices 0..3 back the four flip combinations selected by
+	 * sprite.rot_data2 (= the SNES sprite flip).  Each 16-halfword matrix
+	 * block overlaps the *unused* attribute-3 halfword of four consecutive
+	 * OAM sprites (attr3 is never used for a normal sprite here; a sprite's
+	 * tile/palette live in attr2), so writing PA/PD - and explicitly zeroing
+	 * the PB/PC shear terms - cannot corrupt a sprite's tile or palette bits.
+	 * These writes MUST stay after the per-sprite attribute loop above,
+	 * otherwise that loop would clear the matrix parameters again.
+	 *
+	 * Pa = hdx @ +3, Pc = vdx @ +7, Pb = hdy @ +11, Pd = vdy @ +15. */
 	if (CFG.Scaled == 1) // Half scaling
 	{
 		// Pa (X scale)
 		OAM[3] = 0x0100;
-		// Pd (Y scale) : 192/224
-		//OAM[15] = 0x012A;
+		OAM[7] = OAM[11] = 0;   // Pb/Pc: no shear
+		// Pd (Y scale)
 		OAM[15] = 0x0110;
 		// H FLIP
 		OAM[16+3] = 0xFF01;
-		//OAM[16+15] = 0x012A;
+		OAM[16+7] = OAM[16+11] = 0;
 		OAM[16+15] = 0x0110;
 		// V FLIP
 		OAM[32+3] = 0x0100;
-		//OAM[32+15] = 0xFED6;
+		OAM[32+7] = OAM[32+11] = 0;
 		OAM[32+15] = 0xFEF1;
 		// H + V FLIP
 		OAM[48+3] = 0xFF01;
-		//OAM[48+15] = 0xFED6;
+		OAM[48+7] = OAM[48+11] = 0;
 		OAM[48+15] = 0xFEF1;
 	}
-	else // Full scaling
+	else if (CFG.Scaled == 2) // Full scaling
 	{
 		// Pa (X scale)
 		OAM[3] = 0x0100;
-		// Pd (Y scale) : 192/224
-		//OAM[15] = 0x012A;
+		OAM[7] = OAM[11] = 0;   // Pb/Pc: no shear
+		// Pd (Y scale)
 		OAM[15] = 0x0120;
 		// H FLIP
 		OAM[16+3] = 0xFF01;
-		//OAM[16+15] = 0x012A;
+		OAM[16+7] = OAM[16+11] = 0;
 		OAM[16+15] = 0x0120;
 		// V FLIP
 		OAM[32+3] = 0x0100;
-		//OAM[32+15] = 0xFED6;
+		OAM[32+7] = OAM[32+11] = 0;
 		OAM[32+15] = 0xFEE0;
 		// H + V FLIP
 		OAM[48+3] = 0xFF01;
-		//OAM[48+15] = 0xFED6;
+		OAM[48+7] = OAM[48+11] = 0;
 		OAM[48+15] = 0xFEE0;
 	}
 }
@@ -1468,6 +1557,26 @@ void renderMode1(NB_BG, MODE_1, MODE_2, MODE_3, MODE_4)
   if ((SB&0x01)) {
     DRAW_PLANE(0, MODE_1);
   }  	
+}
+
+/* Mode 0: four 2bpp backgrounds mapped onto the four DS BG layers
+ * (GFX index 0..3 = SNES BG1..BG4, DS BG0..BG3). */
+void renderMode0()
+{
+   uint32 SB = (PPU_PORT[0x2D]|PPU_PORT[0x2C])&CFG.BG_Layer&0x0F;
+
+   if ((SB&0x08)) {
+    DRAW_PLANE(3, 2);
+  }
+  if ((SB&0x04)) {
+    DRAW_PLANE(2, 2);
+  }
+  if ((SB&0x02)) {
+    DRAW_PLANE(1, 2);
+  }
+  if ((SB&0x01)) {
+    DRAW_PLANE(0, 2);
+  }
 }
 
 void renderMode3(MODE_1, MODE_2)
@@ -1564,8 +1673,9 @@ void PPU_RenderLineMode1(uint32 NB_BG, uint32 MODE_1, uint32 MODE_2, uint32 MODE
   l->lDISPLAY_CR = MODE_0_2D | DISPLAY_SPR_2D | (SB << 8);
   l->lBG0_CR = BG_MOSAIC_ON |BG_COLOR_16 | order[0] | (GFX.tile_slot[0]<<2)  | (GFX.map_slot_ds[0]<<8) | GFX.map_size[0];
   l->lBG1_CR = BG_MOSAIC_ON |BG_COLOR_16 | order[1] | (GFX.tile_slot[1]<<2)  | (GFX.map_slot_ds[1]<<8) | GFX.map_size[1];
-  if (CFG.Scaled != 0 || (GFX.YScroll == 16 && CFG.BG3Squish == 0))
-  l->lBG2_CR = BG_MOSAIC_ON |BG_COLOR_16 | order[2] | (GFX.tile_slot[2]<<2)  | (GFX.map_slot_ds[2]<<8) | GFX.map_size[2];
+  /* BG2's control register must always be written: the old code only set it
+   * when CFG.Scaled != 0, which left a stale/uninitialised layer CR otherwise. */
+  l->lBG2_CR = BG_MOSAIC_ON | BG_COLOR_16 | order[2] | (GFX.tile_slot[2]<<2)  | (GFX.map_slot_ds[2]<<8) | GFX.map_size[2];
 
   /* Transparency */
   if (CFG.Transparency && (PPU_PORT[0x30]&0x02) && (PPU_PORT[0x31] != 0))
@@ -1594,6 +1704,62 @@ void PPU_RenderLineMode1(uint32 NB_BG, uint32 MODE_1, uint32 MODE_2, uint32 MODE
   	l->lBLEND = BLEND_NONE;
   }
 
+}
+
+/*
+ * Mode 0 per-scanline register setup: all four backgrounds are 16-colour
+ * (2bpp) and use DS BG0..BG3.  Priority is taken from CFG.LayerPr when the
+ * user picked a manual layout, otherwise from the SNES default BG order
+ * (BG1 front-most).  Every CR is written unconditionally (including BG2/BG3)
+ * so no stale line info can leak between frames.
+ */
+void PPU_RenderLineMode0(t_GFX_lineInfo *l)
+{
+  uint32  order[4];
+  uint32  SB;
+
+  if (CFG.LayersConf == 0)
+  {
+    order[0] = 0; /* SNES BG1 -> DS BG0 (front) */
+    order[1] = 1; /* SNES BG2 -> DS BG1 */
+    order[2] = 2; /* SNES BG3 -> DS BG2 */
+    order[3] = 3; /* SNES BG4 -> DS BG3 (back) */
+  }
+  else
+  {
+    order[0] = CFG.LayerPr[0];
+    order[1] = CFG.LayerPr[1];
+    order[2] = CFG.LayerPr[2];
+    order[3] = CFG.LayerPr[3];
+  }
+
+  /* Main-screen enable bits for SNES BG1..BG4 */
+  SB = (PPU_PORT[0x2D]|PPU_PORT[0x2C])&CFG.BG_Layer&0x0F;
+
+  l->lDISPLAY_CR = MODE_0_2D | DISPLAY_SPR_2D | (SB << 8);
+  l->lBG0_CR = BG_MOSAIC_ON | BG_COLOR_16 | order[0] | (GFX.tile_slot[0]<<2) | (GFX.map_slot_ds[0]<<8) | GFX.map_size[0];
+  l->lBG1_CR = BG_MOSAIC_ON | BG_COLOR_16 | order[1] | (GFX.tile_slot[1]<<2) | (GFX.map_slot_ds[1]<<8) | GFX.map_size[1];
+  l->lBG2_CR = BG_MOSAIC_ON | BG_COLOR_16 | order[2] | (GFX.tile_slot[2]<<2) | (GFX.map_slot_ds[2]<<8) | GFX.map_size[2];
+  l->lBG3_CR = BG_MOSAIC_ON | BG_COLOR_16 | order[3] | (GFX.tile_slot[3]<<2) | (GFX.map_slot_ds[3]<<8) | GFX.map_size[3];
+
+  /* Transparency (same model as the Mode 1 renderer) */
+  if (CFG.Transparency && (PPU_PORT[0x30]&0x02) && (PPU_PORT[0x31] != 0))
+  {
+  	int AB;
+  	if (PPU_PORT[0x31]&0x40) // Half blending
+  		AB = 0x0808;
+  	else
+  		AB = 0x0F0F;
+
+  	int source = PPU_PORT[0x2C]&PPU_PORT[0x31]&0x1F;
+  	int destination = PPU_PORT[0x2D]&0x1F;
+
+  	l->lBLEND = BLEND_ALPHA | (destination << 8) | (source) | (AB << 16);
+  }
+  else
+  {
+  	l->lBLEND = BLEND_NONE;
+  }
 }
 
 void PPU_RenderLineMode3(uint32 MODE_1, uint32 MODE_2, t_GFX_lineInfo *l)
@@ -1650,27 +1816,33 @@ void renderMode7(){
 	if (!(CFG.BG_Layer & 0x1))
 		return;
 		
-	// Update one frame on 4
+	// Update one frame on 4 (the affine registers are cheap; the VRAM copy
+	// below is the expensive part and is gated on an actual change).
 	// FIXME : find a better method to speed up MODE 7
 	if ((Mode7FrameSkip++ & 3) == 0)
 		return;
 
-    // Copy map
-	uint16	*map_addr = (uint16*)BG_MAP_RAM(0);
-	uint8	*VRAM = SNESC.VRAM;
-	uint8	*VRAM1 = SNESC.VRAM+1;
-	int		i, j;
-	for (i = 0, j = 0; i < 128*128*2; i+=4, j++){
-		uint16	t;
-		t = VRAM[i]+(VRAM[i+2]<<8); 
-		map_addr[j] = t;
-	}
-	// Copy tile data
+	/* Re-copy only when the Mode 7 map/tile data changed (mode7_dirty set by
+	 * check_tile on VRAM writes) or the tile slot moved. */
+	if (GFX.mode7_copied && !GFX.mode7_dirty && GFX.mode7_last_slot == GFX.tile_slot[0])
+		return;
+
+	GFX.mode7_last_slot = GFX.tile_slot[0];
+	GFX.mode7_dirty = 0;
+	GFX.mode7_copied = 1;
+
+	/* SNESC.VRAM holds the Mode 7 map as 4-byte groups [m m' t t']. Use one
+	 * 32-bit load per group and de-interleave with masks/shifts, instead of
+	 * two byte loads per output word in each of the two original loops. The
+	 * source is the malloc'd, word-aligned VRAM buffer. */
+	uint32	*src = (uint32*)SNESC.VRAM;
+	uint16	*map_addr  = (uint16*)BG_MAP_RAM(0);
 	uint16	*tile_addr = (uint16*)BG_TILE_RAM(GFX.tile_slot[0]);
-	for (i = 0, j = 0; i < 128*128*2; i+=4, j++){
-		uint16	t;
-		t = VRAM1[i]+(VRAM1[i+2]<<8); 
-		tile_addr[j] = t;
+	int		j;
+	for (j = 0; j < (128*128)/2; j++){
+		uint32	w = src[j];
+		map_addr[j]  = (uint16)( (w        & 0xFF) | ((w >>  8) & 0xFF00));
+		tile_addr[j] = (uint16)(((w >>  8) & 0xFF) | ((w >> 16) & 0xFF00));
 	}
 }
 
@@ -1710,6 +1882,12 @@ void PPU_reset()
   memset(ToUpdate4b, 0, 100);
   
   GFX.spr_bank = 0;	
+
+  // Invalidate the per-line register cache (DISPCNT was just cleared) and
+  // force a fresh Mode 7 VRAM copy after the VRAM reset above.
+  s_lineCacheValid = 0;
+  GFX.mode7_copied = 0;
+  GFX.mode7_dirty = 1;
 }
 
 inline void	PPU_setBackColor(uint rgb)
@@ -1751,10 +1929,38 @@ void	update_scrollx(int bg)
 #endif
 
 
+/* ---- lineInfo producer/consumer race guard (audit C10/G5) ---------------
+ * PPU_line_render()/PPU_line_render_scaled() run on the main thread and write
+ * GFX.lineInfo[y]; HblankUser() -> PPU_updateGFX() reads the same struct from
+ * the DS VCOUNT IRQ.  On the single ARM9 core that IRQ can preempt the producer
+ * mid-write, so the consumer could otherwise observe a half-written
+ * t_GFX_lineInfo (torn BG scroll/CR => per-line jitter).  A per-line seqlock
+ * (odd == being written) makes the consumer skip any line that is mid-write.
+ * Because the producer cannot run while the IRQ is executing, a line whose
+ * sequence is even is guaranteed complete. */
+static volatile uint32 s_lineSeq[192];
+
+static inline void lineSeqBegin(int y) {
+    s_lineSeq[y]++;                 /* -> odd: invalidate the line */
+}
+static inline void lineSeqEnd(int y) {
+    /* Drain the write buffer so the struct stores are visible before the line
+     * is published as stable (same-core write-buffer ordering). */
+    asm volatile("mcr p15, 0, %0, c7, c10, 4" ::: "memory");
+    s_lineSeq[y]++;                 /* -> even: stable */
+}
+
 //__attribute__((section(".itcm"))) //if in ITCM, causes crashes after beating DKC3 1st boss
 void	PPU_updateGFX(int line)
 {
-	t_GFX_lineInfo *l = &GFX.lineInfo[line];
+	t_GFX_lineInfo *l;
+	uint32	*cr, *scr;
+
+	/* Never consume a scanline the producer is in the middle of writing. */
+	if (s_lineSeq[line] & 1u)
+		return;
+
+	l = &GFX.lineInfo[line];
 	
 	if (l->mode & 0xf8)
 	{
@@ -1762,6 +1968,7 @@ void	PPU_updateGFX(int line)
 	{
 		// Blank line
 		DISPCNT |= DISPLAY_SCREEN_OFF;
+		s_lineCacheValid = 0;	// DISPCNT changed outside the write cache
 		return;
 	}	
 	if (l->mode & 0x10)
@@ -1803,48 +2010,63 @@ void	PPU_updateGFX(int line)
 		BG3_CY = l->CY;*/
 		
 		DISPCNT = l->lDISPLAY_CR;
-		REG_BG3CNT = BG_MOSAIC_ON | l->lBG3_CR;		
+		REG_BG3CNT = BG_MOSAIC_ON | l->lBG3_CR;
+		s_lineCacheValid = 0;	// affine + DISPCNT + BG3CNT written
 		return;		
 	}
 
-	DISPCNT = l->lDISPLAY_CR;
-	BG_PALETTE[0] = l->lBACK_color;
-	
-	// Write scrollings regs 
-	asm("ldr  	r2, [%1, #0];"
-		"str  	r2, [%0, #0];"
-		"ldr	r2, [%1, #4];"
-		"str 	r2, [%0, #4];"
-		"ldr	r2, [%1, #8];"
-		"str 	r2, [%0, #8];"
-		"ldr	r2, [%1, #12];"
-		"str 	r2, [%0, #12];"		
-		: :	"r"(0x04000010), "r"(&l->lBG0_X0) : "r2");	
-	/*BG0_X0 = l->lBG0_X0;
-	BG0_Y0 = l->lBG0_Y0;
-	BG1_X0 = l->lBG1_X0;
-	BG1_Y0 = l->lBG1_Y0;
-	BG2_X0 = l->lBG2_X0;
-	BG2_Y0 = l->lBG2_Y0;*/
-	/*BG3_X0 = l->lBG3_X0;
-	BG3_Y0 = l->lBG3_Y0;*/
-	
-	// Write CR regs
-	asm("ldr  	r2, [%1, #0];"
-		"str  	r2, [%0, #0];"
-		"ldr	r2, [%1, #4];"
-		"str 	r2, [%0, #4];"
-		: :	"r"(0x04000008), "r"(&l->lBG0_CR) : "r2");	
-/*	BG0_CR = l->lBG0_CR;
-	BG1_CR = l->lBG1_CR;
-	BG2_CR = l->lBG2_CR;*/
-//	BG3_CR = 0;
+	/* BG0..BG3 control registers are contiguous in t_GFX_lineInfo, as are
+	 * BG0..BG3 HOFS/VOFS, so each group can be compared as a few words and
+	 * only rewritten when it actually changed versus the previous line. */
+	cr  = (uint32 *)&l->lBG0_CR;    /* 2 words: BG0CR..BG3CR */
+	scr = (uint32 *)&l->lBG0_X0;    /* 4 words: BG0..BG3 X0/Y0 */
+
+	if (!s_lineCacheValid || l->lDISPLAY_CR != s_lastDISPCNT)
+	{
+		DISPCNT = l->lDISPLAY_CR;
+		s_lastDISPCNT = l->lDISPLAY_CR;
+	}
+	if (!s_lineCacheValid || l->lBACK_color != s_lastBACK)
+	{
+		BG_PALETTE[0] = l->lBACK_color;
+		s_lastBACK = l->lBACK_color;
+	}
+
+	// Write BG0..BG3 control registers (8 bytes @ 0x04000008)
+	if (!s_lineCacheValid || cr[0] != s_lastCR0 || cr[1] != s_lastCR1)
+	{
+		asm("ldr  	r2, [%1, #0];"
+			"str  	r2, [%0, #0];"
+			"ldr	r2, [%1, #4];"
+			"str 	r2, [%0, #4];"
+			: :	"r"(0x04000008), "r"(cr) : "r2");
+		s_lastCR0 = cr[0]; s_lastCR1 = cr[1];
+	}
+
+	// Write BG0..BG3 scroll (16 bytes @ 0x04000010)
+	if (!s_lineCacheValid || scr[0]!=s_lastSCR0 || scr[1]!=s_lastSCR1 || scr[2]!=s_lastSCR2 || scr[3]!=s_lastSCR3)
+	{
+		asm("ldr  	r2, [%1, #0];"
+			"str  	r2, [%0, #0];"
+			"ldr	r2, [%1, #4];"
+			"str 	r2, [%0, #4];"
+			"ldr	r2, [%1, #8];"
+			"str 	r2, [%0, #8];"
+			"ldr	r2, [%1, #12];"
+			"str 	r2, [%0, #12];"		
+			: :	"r"(0x04000010), "r"(scr) : "r2");
+		s_lastSCR0=scr[0]; s_lastSCR1=scr[1]; s_lastSCR2=scr[2]; s_lastSCR3=scr[3];
+	}
 
 	// BLEND
-	(*(vuint32*)0x04000050) = l->lBLEND; 
-		
+	if (!s_lineCacheValid || l->lBLEND != s_lastBLEND)
+	{
+		(*(vuint32*)0x04000050) = l->lBLEND; 
+		s_lastBLEND = l->lBLEND;
+	}
 
-	
+	s_lineCacheValid = 1;
+
 //	BRIGHTNESS = l->lBRIGHTNESS;
 }
 
@@ -1867,6 +2089,7 @@ void	PPU_line_handle_BG3()
   }	
   if (y >= 0 && y < 192)
   {	
+	lineSeqBegin(y);
 	l = &GFX.lineInfo[y];
 	//FIXME move me elsewhee... duplicate code here
 	int order, SB;
@@ -1896,10 +2119,23 @@ void	PPU_line_handle_BG3()
 			l->lBG2_Y0 = PPU_PORT[(0x0E)+(2<<1)]+GFX.BG3YScroll+CFG.BG3Squish*8;
 	} else
 	l->lBG2_Y0 = PPU_PORT[(0x0E)+(2<<1)]+GFX.BG3YScroll;
+	lineSeqEnd(y);
   }
 }
 
+static void	PPU_line_render_body(void);
+
 void	PPU_line_render()
+{
+	int y = SNES.V_Count-GFX.YScroll;
+	if (y < 0 || y >= 192)
+		return;
+	lineSeqBegin(y);
+	PPU_line_render_body();
+	lineSeqEnd(y);
+}
+
+static void	PPU_line_render_body()
 {
 	int y;
 	t_GFX_lineInfo *l;
@@ -1994,7 +2230,7 @@ void	PPU_line_render()
    
     //l->lBRIGHTNESS = (2<<14) | ((0x0f - GFX.brightness)<<1);
     switch (PPU_PORT[0x05]&7) {
-      case 0 : PPU_RenderLineMode1(4, 2, 2, 2, 2, l); break;
+      case 0 : if (CFG.Mode0Fix) PPU_RenderLineMode0(l); else PPU_RenderLineMode1(4, 2, 2, 2, 2, l); break;
       case 1 : PPU_RenderLineMode1(3, 4, 4, 2, 0, l); break;
       case 2 : PPU_RenderLineMode1(2, 4, 4, 0, 0, l); break;
       case 3 : PPU_RenderLineMode3(   8, 4, l); break;
@@ -2005,16 +2241,25 @@ void	PPU_line_render()
     }
 }
 
+static void	PPU_line_render_scaled_body(void);
+
 void	PPU_line_render_scaled()
+{
+	int y = PPU_scaledLine(SNES.V_Count);	/* exact inverse of the BG scroll-step mapping */
+	if (y < 0 || y >= 192)
+		return;
+	lineSeqBegin(y);
+	PPU_line_render_scaled_body();
+	lineSeqEnd(y);
+}
+
+static void	PPU_line_render_scaled_body()
 {
 	int y;
 	t_GFX_lineInfo *l;
 	int offset = (CFG.Scaled == 1) ? 8 : 0;
 	
-	if (CFG.Scaled == 1) // Half scaling
-		y = (SNES.V_Count-offset) * 192 / 208;
-	else
-		y = SNES.V_Count * 192 / 224;
+	y = PPU_scaledLine(SNES.V_Count);	/* exact inverse of the BG scroll-step mapping */
 	
 	if (y < 0 || y >= 192)
 		return;
@@ -2092,12 +2337,12 @@ void	PPU_line_render_scaled()
     l->lBG3_Y0 = PPU_PORT[(0x0E)+(CFG.TilePriorityBG<<1)]+offset+y/per_px;
     }
 	
-	if (y % per_px == per_px-1)
+	if (CFG.Bilinear && y % per_px == per_px-1)
 		l->mode |= 0x40;
    
     //l->lBRIGHTNESS = (2<<14) | ((0x0f - GFX.brightness)<<1);
     switch (PPU_PORT[0x05]&7) {
-      case 0 : PPU_RenderLineMode1(4, 2, 2, 2, 2, l); break;
+      case 0 : if (CFG.Mode0Fix) PPU_RenderLineMode0(l); else PPU_RenderLineMode1(4, 2, 2, 2, 2, l); break;
       case 1 : PPU_RenderLineMode1(3, 4, 4, 2, 0, l); break;
       case 2 : PPU_RenderLineMode1(2, 4, 4, 0, 0, l); break;
       case 3 : PPU_RenderLineMode3(   8, 4, l); break;
@@ -2151,8 +2396,13 @@ void draw_screen()
       GFX.Sprites_table_dirty = 0;  	
     }
     
+    // Leaving Mode 7 invalidates the (gated) Mode 7 VRAM copy so the next
+    // Mode 7 frame re-copies from scratch.
+    if ((PPU_PORT[0x05]&7) != 7)
+    	GFX.mode7_copied = 0;
+
     switch (PPU_PORT[0x05]&7) {
-      case 0 : renderMode1(4, 2, 2, 2, 2); break;
+      case 0 : if (CFG.Mode0Fix) renderMode0(); else renderMode1(4, 2, 2, 2, 2); break;
       case 1 : renderMode1(3, 4, 4, 2, 0); break;
       case 2 : renderMode1(2, 4, 4, 0, 0); break;
       case 3 : renderMode3(   8, 4); break;

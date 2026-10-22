@@ -72,6 +72,33 @@ GNU General Public License for more details.
 #define LoROM32kShift ((int)15)
 #define LoROMHandleOffset(bank, offset) (int)( ( ( bank >= 0x80 ? bank % 0x80 : bank ) <<LoROM32kShift) + (offset&0x7FFF) )
 
+/* ------------------------------------------------------------------------
+ * Game-specific hack database (consolidates the previously scattered
+ * title-prefix special cases). Keyed by header-title prefix and, optionally,
+ * an exact CRC32 (crc == 0 means "match on the title prefix only").
+ * ---------------------------------------------------------------------- */
+typedef struct {
+	const char	*title;
+	uint32		crc;               /* 0 = title-only match */
+	unsigned char	twl16MB;           /* force 16MB EWRAM in TWL mode */
+	unsigned char	romOffset4M;       /* ROM += 4MB (TWL) */
+	unsigned char	dkc3RomBase;       /* ROM = 0x20F9F00 + 4MB (TWL) */
+	unsigned char	bofRomOffset256K;  /* ROM += 256KB (TWL BOF fix) */
+	unsigned char	romMaskRO;         /* LoROM direct ROM mapping (read-only) */
+	unsigned char	loRom8M;           /* NTR LoROM 8MB map window (MMX2 lockup fix) */
+	unsigned char	apuCache;          /* allow BRR sample cache */
+	unsigned char	apuSlow;           /* APU slowdown (BOF) */
+	unsigned char	apuCacheTWLSlow;   /* slower TWL sample rate (Earthbound) */
+	unsigned char	speedhack;         /* CPU_speedhack value */
+} s_game_hack;
+
+/* Lightweight cheat entry (Game Genie / PAR / raw). */
+typedef struct {
+	uint32	addr;              /* SNES 24-bit address */
+	uint8	value;             /* replacement byte */
+	uint8	enabled;
+} s_cheat;
+
 #endif /*MEMMAP_H_*/
 
 #ifdef ARM9
@@ -118,6 +145,15 @@ extern u8 * SNES_ROM_PAGING_ADDRESS;
 
 extern u8 * APU_BRR_HASH_BUFFER_NTR;
 extern int ROM_PAGING_SIZE;
+
+/* game_hacks / cheat engine (snemulds_memmap.c) */
+extern const s_game_hack *GameHack_Find(const char *title, uint32 crc);
+extern int  cheat_count;
+extern void cheat_clear(void);
+extern void cheat_load(void);
+extern int  cheat_add(uint32 addr, uint8 value);
+extern int  cheat_parse(const char *code);
+extern void cheat_apply(void);
 
 #if defined(_MSC_VER)
 extern u8 bgMapVRAM[128*1024];

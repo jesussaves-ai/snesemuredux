@@ -125,6 +125,34 @@ void PPU_ChangeLayerConf(int i)
 	CFG.LayerPr[3] = LayersConf[CFG.LayersConf][3];
 }
 
+/* Human-readable names for the 10 automatic layer-priority presets
+ * (LayersConf[10][4]). These replace the previous raw numeric/octal config
+ * fields with a named "LayerPreset" entry (front-most BG first). */
+const char *LayerPresetNames[10] =
+{
+	"BG1>BG2>BG3>BG4",  /* 0: {0,1,2,3} */
+	"BG3>BG1>BG2>BG4",  /* 1: {1,2,0,3} */
+	"BG3 front, rest low", /* 2: {3,3,2,3} */
+	"All equal",        /* 3: {3,3,3,3} */
+	"All mid (2)",      /* 4: {2,2,2,2} */
+	"All high (1)",     /* 5: {1,1,1,1} */
+	"All top (0)",      /* 6: {0,0,0,0} */
+	"BG3>BG4>BG1>BG2",  /* 7: {2,3,0,1} */
+	"BG2>BG4>BG1>BG3",  /* 8: {2,0,3,1} */
+	"BG3>BG2>BG1>BG4",  /* 9: {2,1,0,3} */
+};
+
+int LayerPresetIndex(const char *name)
+{
+	int i;
+	if (name == NULL)
+		return -1;
+	for (i = 0; i < 10; i++)
+		if (strcmp(name, LayerPresetNames[i]) == 0)
+			return i;
+	return -1;
+}
+
 void readOptionsFromConfig(char *section)
 {
 	//Initial Dirs
@@ -145,6 +173,7 @@ void readOptionsFromConfig(char *section)
 		CFG.YScroll = 3;	
 	
 	CFG.Scaled = get_config_int(section, "Scaled", CFG.Scaled);
+	CFG.Bilinear = get_config_int(section, "Bilinear", 1); /* default on (current behaviour) */
 	CFG.Sound_output = get_config_int(section, "Sound", CFG.Sound_output) & 1;
 	CFG.BG_Layer = (get_config_int(section, "HDMA", 1)&1) << 7;
 
@@ -161,6 +190,14 @@ void readOptionsFromConfig(char *section)
 		CFG.BG_Layer |= 0x10;
 
 	CFG.LayersConf = get_config_int(section, "BGPriorities", CFG.LayersConf);
+	{
+		// Named preset (new, human-readable) takes precedence over the legacy
+		// numeric "BGPriorities" field.
+		const char *preset = (const char*)get_config_string(section, "LayerPreset", NULL);
+		int pi = LayerPresetIndex(preset);
+		if (pi >= 0)
+			CFG.LayersConf = pi;
+	}
 	if (CFG.LayersConf == 10)
 	{
 		int BGManualPriority = get_config_oct(section, "BGManualPriority",
@@ -226,6 +263,11 @@ void readOptionsFromConfig(char *section)
 	CFG.SpritePr[1] = (SpritePriority>>3) & 3;
 	CFG.SpritePr[2] = (SpritePriority>>6) & 3;
 	CFG.SpritePr[3] = (SpritePriority>>9) & 3;
+	// Structured per-sprite fields (new) override the legacy octal blob.
+	CFG.SpritePr[0] = get_config_int(section, "Spr1Pr", CFG.SpritePr[0]) & 3;
+	CFG.SpritePr[1] = get_config_int(section, "Spr2Pr", CFG.SpritePr[1]) & 3;
+	CFG.SpritePr[2] = get_config_int(section, "Spr3Pr", CFG.SpritePr[2]) & 3;
+	CFG.SpritePr[3] = get_config_int(section, "Spr4Pr", CFG.SpritePr[3]) & 3;
 	
 	//CFG.MapExtMem = get_config_int(section, "MapExtMem", CFG.MapExtMem);
 	
@@ -240,6 +282,7 @@ void saveOptionsToConfig(char *section)
 	set_config_int(section, "Sound", CFG.Sound_output);
 	
 	set_config_int(section, "Scaled", CFG.Scaled);
+	set_config_int(section, "Bilinear", CFG.Bilinear);
 	//	set_config_int(section, "GFXEngine", CFG.TileMode);
 	//	set_config_int(section, "HDMA", CFG.BG_Layer>>7);
 
@@ -248,6 +291,19 @@ void saveOptionsToConfig(char *section)
 			|((CFG.BG_Layer & 0x10)<<8));
 
 	set_config_int(section, "BGPriorities", CFG.LayersConf);
+
+	// Named, human-readable preset for the automatic ordering, plus structured
+	// per-layer/per-sprite priority fields (replacing the raw octal blobs).
+	if (CFG.LayersConf >= 0 && CFG.LayersConf < 10)
+		set_config_string(section, "LayerPreset", (sint8*)LayerPresetNames[CFG.LayersConf]);
+	set_config_int(section, "BG1Pr", CFG.LayerPr[0]);
+	set_config_int(section, "BG2Pr", CFG.LayerPr[1]);
+	set_config_int(section, "BG3Pr", CFG.LayerPr[2]);
+	set_config_int(section, "BG4Pr", CFG.LayerPr[3]);
+	set_config_int(section, "Spr1Pr", CFG.SpritePr[0]);
+	set_config_int(section, "Spr2Pr", CFG.SpritePr[1]);
+	set_config_int(section, "Spr3Pr", CFG.SpritePr[2]);
+	set_config_int(section, "Spr4Pr", CFG.SpritePr[3]);
 
 	//	set_config_int(section, "Transparency", CFG.Transparency);
 	set_config_int(section, "Vblank", CFG.WaitVBlank);
@@ -368,6 +424,7 @@ bool loadROM(char *name, int confirm){
 	int ROMheader;
 	char *ROM;
 	int crc;
+	const s_game_hack *hack = NULL;
 	ROM_MAX_SIZE = 0;
 	CFG.LargeROM = 0;
 	strcpy(romname, name);
@@ -394,17 +451,12 @@ bool loadROM(char *name, int confirm){
 	char titleRead[32];
 	strcpy(titleRead, &SNES.ROM_info.title[0]);
 	SNEMULDS_IPC->APUSlowdown = (int)0; //No game titles slow down the APU, unless explicitely told.
-	if(
-		(__dsimode == true)
-		&&
-		(
-		(strncmpi((char*)&titleRead[0], "MEGAMAN X", 9) == 0)
-		||
-		(strncmpi((char*)&titleRead[0], "DONKEY KONG COUNTRY 3", 21) == 0)
-		||
-		(strncmpi((char*)&titleRead[0], "EARTH BOUND", 11) == 0) 
-		)
-	){
+
+	// Identify the game from the consolidated hack database (title prefix +
+	// header CRC32) instead of the previously scattered strncmpi() chains.
+	hack = GameHack_Find((char*)&titleRead[0], crc32(0, ROM, PAGE_SIZE));
+
+	if( (__dsimode == true) && hack && hack->twl16MB ){
 		//Enable 16M EWRAM (TWL)
 		u32 SFGEXT9 = *(u32*)0x04004008;
 		//14-15 Main Memory RAM Limit (0..1=4MB/DS, 2=16MB/DSi, 3=32MB/DSiDebugger)
@@ -412,25 +464,17 @@ bool loadROM(char *name, int confirm){
 		*(u32*)0x04004008 = SFGEXT9;
 		ROM_MAX_SIZE = ROM_MAX_SIZE_TWLMODE;
 		
-		if (strncmpi((char*)&titleRead[0], "MEGAMAN X", 9) == 0){		//ROM masked as Read-Only, fixes Megaman X1,X2,X3 AP protection, thus making the game playable 100% (1/2)	
-			ROM = (char *)ROM + (4*1024*1024); 
-			setCpuClock(true);
-		}
-		else if (strncmpi((char*)&titleRead[0], "EARTH BOUND", 11) == 0){		//Enable Cached Samples: Earthbound	+ ROM masked as Read-Only
-			ROM = (char *)ROM + (4*1024*1024); 
-			setCpuClock(true);
-		}
-		else if (strncmpi((char*)&titleRead[0], "DONKEY KONG COUNTRY 3", 21) == 0){ //Fix DKC3 on TWL hardware
+		if (hack->dkc3RomBase){				//Fix DKC3 on TWL hardware
 			ROM = ((char *)0x20F9F00) + (4*1024*1024); 
-			setCpuClock(true);
 		}
+		else if (hack->romOffset4M){		//Megaman X / Earthbound: ROM masked as Read-Only
+			ROM = (char *)ROM + (4*1024*1024); 
+		}
+		setCpuClock(true);
 		printf("Extended TWL Mem.");
 	}
 	//NTR/TWL hardware fix: Solves BOF I & II freezing issues after battles 
-	else if(
-		(strncmpi((char*)&titleRead[0], "BREATH OF FIRE", 14) == 0)
-		
-	){
+	else if( hack && hack->bofRomOffset256K ){
 		if(__dsimode == true){
 			//Enable 16M EWRAM (TWL)
 			u32 SFGEXT9 = *(u32*)0x04004008;
@@ -462,12 +506,7 @@ bool loadROM(char *name, int confirm){
 		printf("Normal NTR Mem.");
 	}
 	
-	if(strncmpi((char*)&titleRead[0], "MEGAMAN 7", 9) == 0){
-		CPU_speedhack = 2; //Full Speedhacks: //3 -> Cycles + Interrupts
-	}
-	else{
-		CPU_speedhack = 0; //Speedhacks disabled.
-	}
+	CPU_speedhack = (hack && hack->speedhack) ? (int)hack->speedhack : 0; //0 = Speedhacks disabled
 	
 	//APU cached samples feature--
 	//NTR mode:
@@ -485,7 +524,7 @@ bool loadROM(char *name, int confirm){
 		)
 		||
 		//NTR/TWL Mode: Breath Of Fire runs in paging mode now to get the correct audio speed
-		(strncmpi((char*)&titleRead[0], "BREATH OF FIRE", 14) == 0)	
+		(hack && hack->apuSlow)	
 	){
 		apuCacheSamples = 1;
 		if (ROM_MAX_SIZE == ROM_MAX_SIZE_TWLMODE){	//TWL mode
@@ -499,19 +538,8 @@ bool loadROM(char *name, int confirm){
 		apuCacheSamples = 0;
 	}
 	
-	//Only MegamanX2 & MegamanX3 has cached samples, or, exceptions below.
-	if(
-		(
-			(!(strncmpi((char*)&titleRead[0], "MEGAMAN X2", 10) == 0))
-			&&
-			(!(strncmpi((char*)&titleRead[0], "MEGAMAN X3", 10) == 0))
-		)
-		&&
-		//Prevent from picking up Breath Of Fire games. As they have cached samples enabled in NTR/TWL mode.
-		(
-			!(strncmpi((char*)&titleRead[0], "BREATH OF FIRE", 14) == 0)	
-		)
-	){
+	//Only MegamanX2 & MegamanX3 have cached samples, or, exceptions below.
+	if( !(hack && hack->apuCache) ){
 		apuCacheSamples = 0;
 	}
 	
@@ -531,7 +559,7 @@ bool loadROM(char *name, int confirm){
 	if (
 		(ROM_MAX_SIZE == ROM_MAX_SIZE_TWLMODE)	//TWL mode
 		&&
-		(strncmpi((char*)&titleRead[0], "EARTH BOUND", 11) == 0)	//Earthbound slower samplerate
+		(hack && hack->apuCacheTWLSlow)	//Earthbound slower samplerate
 	){		
 		apuCacheSamplesTWLMode = true;
 		GUI_printf("[Adjusted Samplerate]");
@@ -554,7 +582,7 @@ bool loadROM(char *name, int confirm){
 			||
 			//NTR/TWL Mode: Breath Of Fire runs in paging mode now to get the correct audio speed
 			(
-				(strncmpi((char*)&titleRead[0], "BREATH OF FIRE", 14) == 0)
+				(hack && hack->apuSlow)
 				&&
 				(__dsimode == false)
 			)

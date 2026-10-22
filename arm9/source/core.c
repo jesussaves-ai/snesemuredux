@@ -277,6 +277,97 @@ int	PPU_fastDMA_2118_1(int offs, int bank, int len)
 	return offs+len;
 }
 
+/* Fast DMA into the VRAM data ports $2118/$2119 (mode 0 = fixed register).
+ * The per-byte behaviour is an exact inline replica of W2118/W2119 for the
+ * clean case (GFX.SC_incr == 1, no fine-grain FS_incr), so it stays
+ * byte-identical to the generic PPU_port_write() loop. */
+int	PPU_fastDMA_VRAM_0(int offs, int bank, int len, int port)
+{
+	int i;
+	uint8 *ptr;
+	uint32 hi = (port == 0x2119) ? 1 : 0;
+
+	if (len <= 0)
+		return offs;
+	ptr = (uint8*)map_memory(offs, bank);
+	if (ptr == NULL)
+		return offs;
+
+	for (i = 0; i < len; i++)
+	{
+		uint32 value = ptr[i];
+		uint32 addr = ((PPU_PORT[0x16]<<1) + hi) & 0xFFFF;
+		if (SNESC.VRAM[addr] != (uint8)value)
+			check_tile();
+		SNESC.VRAM[addr] = (uint8)value;
+		/* VMAIN bit7 selects which byte of the pair advances the address. */
+		if (hi ? (PPU_PORT[0x15]&0x80) : !(PPU_PORT[0x15]&0x80))
+			PPU_PORT[0x16] += GFX.SC_incr;
+		if (hi)
+			PPU_PORT[0x19] = value;
+		else
+			PPU_PORT[0x18] = value;
+	}
+	return offs+len;
+}
+
+/* Fast OAM ($2104) DMA, mode 0.  Exact inline replica of the W2104 byte
+ * state-machine (shadow OAM held in GFX.spr_info / spr_info_ext). */
+int	PPU_fastDMA_2104(int offs, int bank, int len)
+{
+	int i;
+	uint8 *ptr;
+
+	if (len <= 0)
+		return offs;
+	ptr = (uint8*)map_memory(offs, bank);
+	if (ptr == NULL)
+		return offs;
+
+	for (i = 0; i < len; i++)
+	{
+		uint32 value = ptr[i];
+		uint32 a = PPU_PORT[0x02];
+
+		if (a >= 0x100)
+		{
+			if (GFX.OAM_upper_byte)
+			{
+				uint32 idx = (a<<1) + 1 - 0x200;
+				if (GFX.spr_info_ext[idx] != (uint8)value){ GFX.spr_info_ext[idx] = (uint8)value; GFX.Sprites_table_dirty = 1; }
+				a++;
+				if (a == 0x110) a = 0;
+				GFX.OAM_upper_byte = 0;
+			}
+			else
+			{
+				uint32 idx = (a<<1) - 0x200;
+				if (GFX.spr_info_ext[idx] != (uint8)value){ GFX.spr_info_ext[idx] = (uint8)value; GFX.Sprites_table_dirty = 1; }
+				GFX.OAM_upper_byte = 1;
+			}
+		}
+		else
+		{
+			if (GFX.OAM_upper_byte)
+			{
+				uint32 idx = (a<<1) + 1;
+				if (((uchar*)GFX.spr_info)[idx] != (uint8)value){ ((uchar*)GFX.spr_info)[idx] = (uint8)value; GFX.Sprites_table_dirty = 1; }
+				a++;
+				GFX.OAM_upper_byte = 0;
+			}
+			else
+			{
+				uint32 idx = (a<<1);
+				if (((uchar*)GFX.spr_info)[idx] != (uint8)value){ ((uchar*)GFX.spr_info)[idx] = (uint8)value; GFX.Sprites_table_dirty = 1; }
+				GFX.OAM_upper_byte = 1;
+			}
+		}
+		PPU_PORT[0x02] = a;
+		PPU_PORT[0x04] = value;
+	}
+	return offs+len;
+}
+
 void DMA_transfert(uchar port)
 {
   uint		tmp;
@@ -307,9 +398,26 @@ void DMA_transfert(uchar port)
 	   
   }  
 
-  if (CFG.FastDMA && PPU_port == 0x2118 && DMA_info == 1)
+  /* The fast paths read the source as one contiguous block through map_memory,
+   * so they are only valid when the transfer does not cross a 64 KB bank
+   * boundary (where the generic loop wraps the 16-bit offset). */
+  if (CFG.FastDMA && PPU_port == 0x2118 && DMA_info == 1 &&
+      (DMA_address + DMA_len) <= 0x10000)
   {
 	  DMA_address = PPU_fastDMA_2118_1(DMA_address, DMA_bank, DMA_len);
+  }
+  else if (CFG.FastDMA && GFX.SC_incr == 1 && !GFX.FS_incr && DMA_info == 0 &&
+           (DMA_address + DMA_len) <= 0x10000 &&
+           (PPU_port == 0x2118 || PPU_port == 0x2119))
+  {
+	  /* Fixed-register VRAM fills ($2118/$2119, mode 0). */
+	  DMA_address = PPU_fastDMA_VRAM_0(DMA_address, DMA_bank, DMA_len, PPU_port);
+  }
+  else if (CFG.FastDMA && DMA_info == 0 && PPU_port == 0x2104 &&
+           (DMA_address + DMA_len) <= 0x10000)
+  {
+	  /* OAM data DMA (mode 0): inline replica of W2104. */
+	  DMA_address = PPU_fastDMA_2104(DMA_address, DMA_bank, DMA_len);
   }
   else
   {

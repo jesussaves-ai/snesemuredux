@@ -173,7 +173,7 @@ void	reset_SNES()
   SNES.PPU_NeedMultiply = 0;
   SNES.DelayedNMI = 0;    
 
-  CFG.BG_Layer = 0xd7; //FIXME: BG3 is not used (MODE 0 broken)
+  CFG.BG_Layer = 0xdf; //bits0-3 = SNES BG1-BG4 enable, bit4 = Mode7, bit7 = HDMA (Mode 0 needs all four)
 
   SNES.V_Count = 0;
   PPU_reset();  
@@ -207,10 +207,25 @@ void	UnInterleaveROM()
   uchar blocks[256], b;
   uchar	*tmp;
 
-  while (nblocks <= step)
+  /* 'step' halves until it is strictly smaller than the block count.  Guard the
+   * loop against nblocks == 0 (0 <= step would otherwise never terminate). */
+  while (step > 0 && nblocks <= step)
     step >>= 1;
-	    
+
   nblocks = step;
+
+  /* blocks[256] is indexed up to nblocks*2, so nblocks must stay <= 128.
+   * Clamp large/malformed ROM sizes so the stack array cannot be overrun. */
+  if (nblocks > 128)
+    nblocks = 128;
+  if (nblocks <= 0)
+    return;
+
+  /* Allocate the 32 KB swap buffer *before* mutating any state so that an
+   * allocation failure leaves the ROM (and SNES.HiROM) untouched. */
+  tmp = TGDSARM9Malloc(0x8000);
+  if (tmp == NULL)
+    return;
 
   if (CFG.InterleavedROM2)
     {
@@ -228,7 +243,6 @@ void	UnInterleaveROM()
         }
    }
 
-   tmp = TGDSARM9Malloc(0x8000);
    for (i = 0;i < nblocks*2;i++)
      {
        for (j = i;j < nblocks*2;j++)

@@ -614,10 +614,18 @@ int GFXConfigHandler(t_GUIZone *zone, int msg, int param, void *arg){
 			set_config_int(SNES.ROM_info.title, "TilePriorityBG", CFG.TilePriorityBG);	
 			set_config_int(SNES.ROM_info.title, "BG3TilePriority", CFG.BG3TilePriority);
 			set_config_int(SNES.ROM_info.title, "BlankTileNumber", CFG.Debug2);
-			set_config_oct(SNES.ROM_info.title, "SpritePriority", 4,
-				CFG.SpritePr[0]+(CFG.SpritePr[1]<<3)+(CFG.SpritePr[2]<<6)+(CFG.SpritePr[3]<<9));
-			set_config_oct(SNES.ROM_info.title, "BGManualPriority", 4,
-				CFG.LayerPr[3]+(CFG.LayerPr[2]<<3)+(CFG.LayerPr[1]<<6)+(CFG.LayerPr[0]<<9));
+			// Human-readable layer preset + structured per-layer/per-sprite
+			// priority fields (replaces the raw octal blobs).
+			if (CFG.LayersConf >= 0 && CFG.LayersConf < 10)
+				set_config_string(SNES.ROM_info.title, "LayerPreset", (sint8*)LayerPresetNames[CFG.LayersConf]);
+			set_config_int(SNES.ROM_info.title, "BG1Pr", CFG.LayerPr[0]);
+			set_config_int(SNES.ROM_info.title, "BG2Pr", CFG.LayerPr[1]);
+			set_config_int(SNES.ROM_info.title, "BG3Pr", CFG.LayerPr[2]);
+			set_config_int(SNES.ROM_info.title, "BG4Pr", CFG.LayerPr[3]);
+			set_config_int(SNES.ROM_info.title, "Spr1Pr", CFG.SpritePr[0]);
+			set_config_int(SNES.ROM_info.title, "Spr2Pr", CFG.SpritePr[1]);
+			set_config_int(SNES.ROM_info.title, "Spr3Pr", CFG.SpritePr[2]);
+			set_config_int(SNES.ROM_info.title, "Spr4Pr", CFG.SpritePr[3]);
 			save_config_file();
 			break;			
 		}
@@ -766,6 +774,9 @@ int LayersOptionsHandler(t_GUIZone *zone, int msg, int param, void *arg){
 		case 15: // IDSAVE	
 			saveOptionsToConfig(SNES.ROM_info.title);
 			return 1;
+		case 18: // TilePriorityBG toggle
+			CFG.TilePriorityBG = ((int)arg >> 24) ? -1 : 1;
+			return 1;
 		case 14: // IDAPPLY
 		case 16: // IDCANCEL
 			TGDSARM9Free(GUI.screen);
@@ -806,12 +817,19 @@ t_GUIScreen *buildLayersMenu(){
 	int i;
 	for (i = 0; i < 4; i++)
 	{
-		GUI_setZone   (scr, 8+i, 64, 80+i*20, 120, 80+i*20+24); // Layer static
+		GUI_setZone   (scr, 8+i, 64, 72+i*20, 120, 72+i*20+24); // Layer static
 		GUI_linkObject(scr, 8+i, GUI_STATIC_RIGHT(i < 3 ? IDS_LAYER : IDS_SPRITES, i),
 						GUIStaticEx_handler);
-		GUI_setZone   (scr, 1+i, 128, 80+i*20, 256, 80+i*20+24); // Layer order button
+		GUI_setZone   (scr, 1+i, 128, 72+i*20, 256, 72+i*20+24); // Layer order button
 		GUI_linkObject(scr, 1+i, GUI_CHOICE(IDS_OFF, 5, 0), GUIChoiceButton_handler);
 	}
+
+	// TilePriorityBG: split one SNES BG into two priority layers (on/off).
+	GUI_setZone   (scr, 17, 0, 156, 120, 156+16);
+	GUI_linkObject(scr, 17, GUI_STATIC_LEFT(IDS_PRIO_PER_TILE, 0), GUIStaticEx_handler);
+	GUI_setZone   (scr, 18, 128, 156, 256, 156+16);
+	GUI_linkObject(scr, 18, GUI_CHOICE(IDS_GC_ON, 2, (CFG.TilePriorityBG != -1) ? 0 : 1), GUIChoiceButton_handler);
+
 	LayerOptionsUpdate();
 
 	for (i = 0; i < 12; i++)
@@ -819,6 +837,8 @@ t_GUIScreen *buildLayersMenu(){
 		scr->zones[i].font = &smallfont_7_font;
 		scr->zones[i].keymask = KEY_A;
 	}
+	scr->zones[17].font = &smallfont_7_font; scr->zones[17].keymask = KEY_A;
+	scr->zones[18].font = &smallfont_7_font; scr->zones[18].keymask = KEY_A;
 	scr->zones[5].font = &trebuchet_9_font;
 	
 	GUI_setZone(scr, 12, 20, 100, 60, 120);
@@ -865,6 +885,9 @@ int ScreenOptionsHandler(t_GUIZone *zone, int msg, int param, void *arg){
 		case 2:
 			CFG.Scaled = (int)arg >> 24;
 			return 1;		
+		case 3: // Bi-linear filtering toggle
+			CFG.Bilinear = ((int)arg >> 24) ? 0 : 1;
+			return 1;
 			
 			
 		case 11: // IDSAVE	
@@ -915,13 +938,18 @@ t_GUIScreen *buildScreenMenu(){
 	GUI_setZone   (scr, 2, 80, 70, 256, 70+16); // Layer order button
 	GUI_linkObject(scr, 2, GUI_CHOICE(IDS_SCALING+1, 3, CFG.Scaled), GUIChoiceButton_handler);
 
+	GUI_setZone   (scr, 7, 0, 90, 80, 90+16); // Bi-linear filtering static
+	GUI_linkObject(scr, 7, GUI_STATIC_LEFT(IDS_BILINEAR, 0), GUIStaticEx_handler);
+	GUI_setZone   (scr, 8, 80, 90, 256, 90+16); // Bi-linear filtering toggle
+	GUI_linkObject(scr, 8, GUI_CHOICE(IDS_GC_ON, 2, CFG.Bilinear ? 0 : 1), GUIChoiceButton_handler);
+
 	// Three elements
 	GUI_setZone(scr, 10, 0, 192-20, 0+88, 192);
 	GUI_setZone(scr, 12, 88, 192-20, 88+80, 192);
 	GUI_setZone(scr, 11, 88+80, 192-20, 256, 192);	
 	
 	int i;
-	for (i = 0; i < 7; i++)
+	for (i = 0; i < 9; i++)
 	{
 		scr->zones[i].font = &smallfont_7_font;
 		scr->zones[i].keymask = KEY_A;

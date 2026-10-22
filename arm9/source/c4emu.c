@@ -78,7 +78,6 @@
 
 #include <string.h>
 #include "snes.h"
-#include <math.h>
 #include "snemulds_memmap.h"
 #include "ppu.h"
 #include "c4.h"
@@ -664,7 +663,7 @@ void S9xSetC4 (uint8 byte, uint16 Address){
               case 0x15: // Pythagorean
                 C41FXVal=READ_WORD(SNESC.C4RAM+0x1f80);
                 C41FYVal=READ_WORD(SNESC.C4RAM+0x1f83);
-                C41FDist=(int16)sqrt((double)C41FXVal*C41FXVal + (double)C41FYVal*C41FYVal);
+                C4Op15(); /* integer sqrt; shared with the 0x0d path (no soft-float) */
                 WRITE_WORD(SNESC.C4RAM+0x1f80, C41FDist);
                 break;
 

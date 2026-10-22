@@ -149,3 +149,21 @@ SECTIONS
 		. = ALIGN(4); 
 	} = 0xff
 }
+
+/* ---------------------------------------------------------------------------
+ * Hard guard rails for the ARM946E-S tightly-coupled memories.
+ *
+ * The .itcm (32KB @ 0x01FF8000) and .dtcm (16KB @ 0x0B000000) output sections
+ * are placed by VMA expression rather than inside a bounded MEMORY region, so
+ * an oversized section would silently overrun the hardware window and corrupt
+ * adjacent memory at run time. These top-level assertions (which must live
+ * outside SECTIONS for GNU ld) turn that silent corruption into a link-time
+ * error and also protect the NTR/TWL builds, which share this script. */
+ASSERT(SIZEOF(.itcm) <= 32K, "Error: .itcm section exceeds 32KB hardware limit!");
+ASSERT(SIZEOF(.dtcm) <= 16K, "Error: .dtcm section exceeds 16KB hardware limit!");
+
+/* The ARM9 payload is placed inside the 4MB main-RAM window that both the NTR
+ * (4MB) and TWL/DSi (16MB) targets guarantee at 0x02000000.  __end is the
+ * EWRAM-relative layout cursor set just before the .pad section. */
+ASSERT(__end <= _ewram_start + 4M, "Error: ARM9 payload exceeds the 4MB NTR EWRAM window!");
+ASSERT(_ewram_end <= _ewram_start + 4M, "Error: EWRAM window misconfigured (must be <= 4MB)!");

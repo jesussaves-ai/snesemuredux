@@ -72,7 +72,6 @@
   Super NES and Super Nintendo Entertainment System are trademarks of
   Nintendo Co., Limited and its subsidiary companies.
 *******************************************************************************/
-#include <math.h>
 #include <stdlib.h>
 #include "c4.h"
 #include "snemulds_memmap.h"
@@ -85,60 +84,125 @@ short C4WFY2Val;
 short C4WFDist;
 short C4WFScale;
 
-static double tanval;
-static double c4x, c4y, c4z;
-static double c4x2, c4y2, c4z2;
+/*
+ * -------------------------------------------------------------------------
+ * Fixed-point CX4 math (no FPU on ARM946E-S)
+ * -------------------------------------------------------------------------
+ * The previous implementation used double/cos/sin/atan/sqrt, forcing libgcc
+ * soft-float on every CX4 vector op. The C4 tables (C4SinTable/C4CosTable in
+ * c4emu.c) are Q1.15 (32767 == 1.0) over a 512-step revolution, and the rest
+ * of the C4 code already consumes them with a 15-bit shift (see
+ * C4DoScaleRotate, and the $10/$13 handlers). This file keeps that same
+ * domain so all C4 math stays integer:
+ *
+ *   C4_FIXED_SHIFT = 15  ->  coordinates are Q16.15 (scale 2^15)
+ *   angles          = 512 steps per revolution (index = -angle * 4)
+ *
+ * With int16 inputs the worst-case rotated magnitude is
+ * sqrt(2) * 32767 * 2^15 = 1.52e9, which fits in int32. Every product is
+ * accumulated in int64 (ARMv5TE SMULL) before a single arithmetic right
+ * shift, so no intermediate truncation occurs and no soft-float is emitted.
+ */
+#define C4_FIXED_SHIFT 15
+#define C4_FIXED_ONE   (1 << C4_FIXED_SHIFT)
+
+/* CX4 angles are in units of 1/128 revolution; table step is 1/512 -> *4 */
+#define C4_ANGLE_TO_INDEX(v)  (((-(int32)(v)) * 4) & 0x1FF)
+
+/* Deterministic integer square root (floor), bit-by-bit, no soft-float.
+ * 64-bit input so callers can request fractional precision by pre-shifting. */
+static uint32 c4_isqrt(int64 n)
+{
+    int64 res = 0;
+    int64 bit = (int64)1 << 62;
+
+    while (bit > n)
+        bit >>= 2;
+    while (bit) {
+        if (n >= res + bit) {
+            n   -= res + bit;
+            res  = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32)res;
+}
 
 void C4TransfWireFrame ()
 {
-    c4x = (double) C4WFXVal;
-    c4y = (double) C4WFYVal;
-    c4z = (double) C4WFZVal - 0x95;
-    
+    int32 c4x, c4y, c4z, c4x2, c4y2, c4z2;
+    int32 s, c, idx;
+
+    c4x = (int32) C4WFXVal << C4_FIXED_SHIFT;
+    c4y = (int32) C4WFYVal << C4_FIXED_SHIFT;
+    c4z = ((int32) C4WFZVal - 0x95) << C4_FIXED_SHIFT;
+
     // Rotate X
-    tanval = -(double) C4WFX2Val * 3.14159265 * 2 / 128;
-    c4y2 = c4y * cos (tanval) - c4z * sin (tanval);
-    c4z2 = c4y * sin (tanval) + c4z * cos (tanval);
-    
+    idx = C4_ANGLE_TO_INDEX(C4WFX2Val);
+    s = C4SinTable[idx];
+    c = C4CosTable[idx];
+    c4y2 = (int32)((((int64)c4y * c) - ((int64)c4z * s)) >> C4_FIXED_SHIFT);
+    c4z2 = (int32)((((int64)c4y * s) + ((int64)c4z * c)) >> C4_FIXED_SHIFT);
+
     // Rotate Y
-    tanval = -(double)C4WFY2Val*3.14159265*2/128;
-    c4x2 = c4x * cos (tanval) + c4z2 * sin (tanval);
-    c4z = c4x * - sin (tanval) + c4z2 * cos (tanval);
-    
+    idx = C4_ANGLE_TO_INDEX(C4WFY2Val);
+    s = C4SinTable[idx];
+    c = C4CosTable[idx];
+    c4x2 = (int32)((((int64)c4x * c) + ((int64)c4z2 * s)) >> C4_FIXED_SHIFT);
+    c4z  = (int32)((((int64)c4z2 * c) - ((int64)c4x * s)) >> C4_FIXED_SHIFT);
+
     // Rotate Z
-    tanval = -(double) C4WFDist * 3.14159265*2 / 128;
-    c4x = c4x2 * cos (tanval) - c4y2 * sin (tanval);
-    c4y = c4x2 * sin (tanval) + c4y2 * cos (tanval);
-    
-    // Scale
-    C4WFXVal = (short) (c4x*(double)C4WFScale/(0x90*(c4z+0x95))*0x95);
-    C4WFYVal = (short) (c4y*(double)C4WFScale/(0x90*(c4z+0x95))*0x95);
+    idx = C4_ANGLE_TO_INDEX(C4WFDist);
+    s = C4SinTable[idx];
+    c = C4CosTable[idx];
+    c4x = (int32)((((int64)c4x2 * c) - ((int64)c4y2 * s)) >> C4_FIXED_SHIFT);
+    c4y = (int32)((((int64)c4x2 * s) + ((int64)c4y2 * c)) >> C4_FIXED_SHIFT);
+
+    // Scale: out = coord * scale / (0x90 * (z + 0x95)) * 0x95.
+    // The 2^15 factors of coord and (z+0x95) cancel, so the quotient is
+    // already in integer units (matches the original double->short cast).
+    {
+        int64 zden = (int64)c4z + ((int64)0x95 << C4_FIXED_SHIFT);
+        C4WFXVal = (short)(((int64)c4x * C4WFScale * 0x95) / (0x90 * zden));
+        C4WFYVal = (short)(((int64)c4y * C4WFScale * 0x95) / (0x90 * zden));
+    }
 }
 
 void C4TransfWireFrame2 ()
 {
-    c4x = (double)C4WFXVal;
-    c4y = (double)C4WFYVal;
-    c4z = (double)C4WFZVal;
-    
+    int32 c4x, c4y, c4z, c4x2, c4y2, c4z2;
+    int32 s, c, idx;
+
+    c4x = (int32) C4WFXVal << C4_FIXED_SHIFT;
+    c4y = (int32) C4WFYVal << C4_FIXED_SHIFT;
+    c4z = (int32) C4WFZVal << C4_FIXED_SHIFT;
+
     // Rotate X
-    tanval = -(double) C4WFX2Val * 3.14159265 * 2 / 128;
-    c4y2 = c4y * cos (tanval) - c4z * sin (tanval);
-    c4z2 = c4y * sin (tanval) + c4z * cos (tanval);
-    
+    idx = C4_ANGLE_TO_INDEX(C4WFX2Val);
+    s = C4SinTable[idx];
+    c = C4CosTable[idx];
+    c4y2 = (int32)((((int64)c4y * c) - ((int64)c4z * s)) >> C4_FIXED_SHIFT);
+    c4z2 = (int32)((((int64)c4y * s) + ((int64)c4z * c)) >> C4_FIXED_SHIFT);
+
     // Rotate Y
-    tanval = -(double) C4WFY2Val * 3.14159265 * 2 / 128;
-    c4x2 = c4x * cos (tanval) + c4z2 * sin (tanval);
-    c4z = c4x * -sin (tanval) + c4z2 * cos (tanval);
-    
+    idx = C4_ANGLE_TO_INDEX(C4WFY2Val);
+    s = C4SinTable[idx];
+    c = C4CosTable[idx];
+    c4x2 = (int32)((((int64)c4x * c) + ((int64)c4z2 * s)) >> C4_FIXED_SHIFT);
+    c4z  = (int32)((((int64)c4z2 * c) - ((int64)c4x * s)) >> C4_FIXED_SHIFT);
+
     // Rotate Z
-    tanval = -(double)C4WFDist * 3.14159265 * 2 / 128;
-    c4x = c4x2 * cos (tanval) - c4y2 * sin (tanval);
-    c4y = c4x2 * sin (tanval) + c4y2 * cos (tanval);
-    
-    // Scale
-    C4WFXVal =(short)(c4x * (double)C4WFScale / 0x100);
-    C4WFYVal =(short)(c4y * (double)C4WFScale / 0x100);
+    idx = C4_ANGLE_TO_INDEX(C4WFDist);
+    s = C4SinTable[idx];
+    c = C4CosTable[idx];
+    c4x = (int32)((((int64)c4x2 * c) - ((int64)c4y2 * s)) >> C4_FIXED_SHIFT);
+    c4y = (int32)((((int64)c4x2 * s) + ((int64)c4y2 * c)) >> C4_FIXED_SHIFT);
+
+    // Scale: out = coord * scale / 0x100  (Q16.15 coord -> integer units)
+    C4WFXVal = (short)(((int64)c4x * C4WFScale) / ((int64)0x100 << C4_FIXED_SHIFT));
+    C4WFYVal = (short)(((int64)c4y * C4WFScale) / ((int64)0x100 << C4_FIXED_SHIFT));
 }
 
 void C4CalcWireFrame ()
@@ -148,7 +212,7 @@ void C4CalcWireFrame ()
     if (abs (C4WFXVal) > abs (C4WFYVal))
     {
         C4WFDist = abs (C4WFXVal) + 1;
-        C4WFYVal = (short) (256 * (double) C4WFYVal / abs (C4WFXVal));
+        C4WFYVal = (short) ((256 * (int32) C4WFYVal) / abs (C4WFXVal));
         if (C4WFXVal < 0)
             C4WFXVal = -256;
         else 
@@ -159,7 +223,7 @@ void C4CalcWireFrame ()
         if (C4WFYVal != 0) 
         {
             C4WFDist = abs(C4WFYVal)+1;
-            C4WFXVal = (short) (256 * (double)C4WFXVal / abs (C4WFYVal));
+            C4WFXVal = (short) ((256 * (int32) C4WFXVal) / abs (C4WFYVal));
             if (C4WFYVal < 0)
                 C4WFYVal = -256;
             else 
@@ -176,6 +240,47 @@ short C41FAngleRes;
 short C41FDist;
 short C41FDistVal;
 
+/*
+ * Table-based atan2 for the CX4 "atan" command (0x1f). Returns the C4 angle
+ * index (0..511, 512 steps per revolution) for the vector (fx, fy) using a
+ * binary search over the Q1.15 sin/cos tables, replacing atan()/division with
+ * pure integer work. Accurate to one table step (2*pi/512 ~= 0.70 deg), which
+ * is the CX4's native trig resolution.
+ */
+static int32 c4_atan2_index(int32 fx, int32 fy)
+{
+    int32 ax = (fx < 0) ? -fx : fx;
+    int32 ay = (fy < 0) ? -fy : fy;
+    int32 lo = 0, hi = 128;
+
+    if (ax == 0)
+        return (fy > 0) ? 0x80 : 0x180;
+
+    /* first octant: find i in [0,128] where Sin[i]/Cos[i] crosses ay/ax */
+    while (lo < hi) {
+        int32 mid = (lo + hi) >> 1;
+        if (((int64)C4SinTable[mid] * ax) >= ((int64)C4CosTable[mid] * ay))
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    /* choose the nearer of the two straddling indices */
+    if (lo > 0) {
+        int64 e0 = (int64)C4SinTable[lo - 1] * ax - (int64)C4CosTable[lo - 1] * ay;
+        int64 e1 = (int64)C4SinTable[lo]     * ax - (int64)C4CosTable[lo]     * ay;
+        if (e0 < 0) e0 = -e0;
+        if (e1 < 0) e1 = -e1;
+        if (e0 < e1)
+            lo = lo - 1;
+    }
+
+    /* fold the first-octant angle into the correct quadrant */
+    if (fx >= 0)
+        return (fy >= 0) ? lo : (0x200 - lo);
+    else
+        return (fy >= 0) ? (0x100 - lo) : (0x100 + lo);
+}
+
 void C4Op1F ()
 {
     if (C41FXVal == 0) 
@@ -187,27 +292,35 @@ void C4Op1F ()
     }
     else 
     {
-        tanval = (double) C41FYVal / C41FXVal;
-        C41FAngleRes = (short) (atan (tanval) / (3.141592675 * 2) * 512);
-        C41FAngleRes = C41FAngleRes;
-        if (C41FXVal< 0) 
-            C41FAngleRes += 0x100;
-        C41FAngleRes &= 0x1FF;
+        C41FAngleRes = (short) (c4_atan2_index(C41FXVal, C41FYVal) & 0x1FF);
     }
 }
 
 void C4Op15()
 {
-    tanval = sqrt ((double) C41FYVal * C41FYVal + (double) C41FXVal * C41FXVal);
-    C41FDist = (short) tanval;
+    uint32 n = (uint32)((int32)C41FXVal * (int32)C41FXVal) +
+               (uint32)((int32)C41FYVal * (int32)C41FYVal);
+    C41FDist = (short) c4_isqrt(n);
 }
 
 void C4Op0D()
 {
-    tanval = sqrt ((double) C41FYVal * C41FYVal + (double) C41FXVal * C41FXVal);
-    tanval = C41FDistVal / tanval;
-    C41FYVal = (short) (C41FYVal * tanval * 0.99);
-    C41FXVal = (short) (C41FXVal * tanval * 0.98);
+    uint32 n = (uint32)((int32)C41FXVal * (int32)C41FXVal) +
+               (uint32)((int32)C41FYVal * (int32)C41FYVal);
+    uint32 d;
+
+    if (n == 0)
+        return;
+
+    /* was: FY *= (C41FDistVal / sqrt(n)) * 0.99 ; FX *= (...) * 0.98.
+     * Use sqrt with 8 fractional bits (d ~= sqrt(n)*256) so the reciprocal
+     * keeps ~2 decimal digits, closely matching the original double path. */
+    d = c4_isqrt((int64)n << 16);
+    if (d == 0)
+        return;
+
+    C41FYVal = (short)(((int64)C41FYVal * C41FDistVal * 99 * 256) / ((int64)d * 100));
+    C41FXVal = (short)(((int64)C41FXVal * C41FDistVal * 98 * 256) / ((int64)d * 100));
 }
 
 #ifdef ZSNES_C4

@@ -35,12 +35,14 @@
 #include "snes.h"
 #include "cfg.h"
 #include "snemulds_memmap.h"
+#include "conf.h"
 
 #ifdef ARM9
 #include "core.h"
 #include "c4.h"
 #include "ipcfifoTGDSUser.h"
 #include "utilsTGDS.h"
+#include "mem_cache.h"
 #endif
 
 #if defined(_MSC_VER)
@@ -55,6 +57,188 @@ u8 * SNES_ROM_ADDRESS = NULL;
 u8 * SNES_ROM_PAGING_ADDRESS = NULL;
 u8 * APU_BRR_HASH_BUFFER_NTR = NULL;
 int ROM_PAGING_SIZE = 0;
+
+/* ==========================================================================
+ * Game-specific hack database
+ *
+ * Consolidates the title-prefix special cases that used to be scattered
+ * across loadROM() (main.c) and InitLoROMMap()/InitHiROMMap(). Each entry is
+ * matched by header-title prefix, optionally qualified by an exact CRC32
+ * (crc == 0 => title-only). More specific prefixes are listed first.
+ * ======================================================================== */
+static const s_game_hack game_hacks[] = {
+	/* title                    crc  twl16 off4M dkc3 bof256 maskRO lo8M apuC apuS apuTWLS speed */
+	{ "MEGAMAN X2",             0,    1,    1,   0,    0,     1,    1,   1,   0,    0,    0 },
+	{ "MEGAMAN X3",             0,    1,    1,   0,    0,     1,    0,   1,   0,    0,    0 },
+	{ "MEGAMAN X",              0,    1,    1,   0,    0,     1,    0,   0,   0,    0,    0 },
+	{ "DONKEY KONG COUNTRY 3",  0,    1,    0,   1,    0,     0,    0,   0,   0,    0,    0 },
+	{ "EARTH BOUND",            0,    1,    1,   0,    0,     0,    0,   0,   0,    1,    0 },
+	{ "BREATH OF FIRE",         0,    1,    0,   0,    1,     0,    0,   1,   1,    0,    0 },
+	{ "MEGAMAN 7",              0,    0,    0,   0,    0,     0,    0,   0,   0,    0,    2 },
+};
+
+const s_game_hack *GameHack_Find(const char *title, uint32 crc){
+	int i;
+	if (title == NULL)
+		return NULL;
+	for (i = 0; i < (int)(sizeof(game_hacks) / sizeof(game_hacks[0])); i++){
+		if (strncmpi((char*)title, (char*)game_hacks[i].title, strlen(game_hacks[i].title)) != 0)
+			continue;
+		if (game_hacks[i].crc != 0 && game_hacks[i].crc != crc)
+			continue;
+		return &game_hacks[i];
+	}
+	return NULL;
+}
+
+/* ==========================================================================
+ * Lightweight cheat engine (Game Genie / Pro Action Replay / raw)
+ *
+ * Codes are read from the [Cheats] section of snemul.cfg (keys "0".."31").
+ * Evaluation is guarded by cheat_count at every mem_* access so uncheated
+ * games pay nothing but a single load+compare.
+ * ======================================================================== */
+#define MAX_CHEATS 32
+int cheat_count = 0;
+static s_cheat cheats[MAX_CHEATS];
+
+void cheat_clear(void){
+	cheat_count = 0;
+}
+
+int cheat_add(uint32 addr, uint8 value){
+	if (cheat_count >= MAX_CHEATS)
+		return -1;
+	cheats[cheat_count].addr = addr & 0xFFFFFF;
+	cheats[cheat_count].value = value;
+	cheats[cheat_count].enabled = 1;
+	cheat_count++;
+	return 0;
+}
+
+static int cheat_hexv(int c){
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+/* SNES Game Genie code alphabet (Snes9x genie_hex) -> nibble value */
+static int cheat_ggnib(int c){
+	static const char g[17] = "DF4709156BC8A23E";
+	int i;
+	if (c >= 'a' && c <= 'z') c -= 32;
+	for (i = 0; i < 16; i++) if (c == g[i]) return i;
+	return -1;
+}
+
+int cheat_parse(const char *code){
+	int len, i, v, colon;
+	uint32 addr;
+	int val;
+
+	if (code == NULL)
+		return -1;
+	while (*code == ' ' || *code == '\t') code++;
+	len = (int)strlen(code);
+	while (len > 0 && (code[len-1] == ' ' || code[len-1] == '\t' ||
+	                   code[len-1] == '\r' || code[len-1] == '\n'))
+		len--;
+	if (len == 0)
+		return 0;
+
+	/* Game Genie: "xxxx-xxxx" (9 chars with the dash) */
+	if (len == 9 && code[4] == '-'){
+		uint8  byte;
+		uint32 data = 0, address;
+		for (i = 0; i < 9; i++){
+			if (code[i] == '-') continue;
+			v = cheat_ggnib(code[i]);
+			if (v < 0) return -1;
+			data = (data << 4) | (uint32)v;
+		}
+		byte    = (uint8)(data >> 24);
+		address = data & 0xFFFFFF;
+		address = ((address & 0x003c00) << 10) +
+		          ((address & 0x00003c) << 14) +
+		          ((address & 0xf00000) >> 8) +
+		          ((address & 0x000003) << 10) +
+		          ((address & 0x00c000) >> 6) +
+		          ((address & 0x0f0000) >> 12) +
+		          ((address & 0x0003c0) >> 6);
+		return cheat_add(address, byte);
+	}
+
+	/* raw "AAAAAA:VV" or Pro Action Replay "AAAAAAVV" */
+	colon = -1;
+	for (i = 0; i < len; i++) if (code[i] == ':') { colon = i; break; }
+	addr = 0; val = 0;
+	if (colon >= 0){
+		if (colon < 1 || colon > 8) return -1;
+		for (i = 0; i < colon; i++){ v = cheat_hexv(code[i]); if (v < 0) return -1; addr = (addr << 4) | (uint32)v; }
+		for (i = colon + 1; i < len; i++){ v = cheat_hexv(code[i]); if (v < 0) return -1; val = (val << 4) | v; }
+	}
+	else if (len == 8){
+		for (i = 0; i < 6; i++){ v = cheat_hexv(code[i]); if (v < 0) return -1; addr = (addr << 4) | (uint32)v; }
+		for (i = 6; i < 8; i++){ v = cheat_hexv(code[i]); if (v < 0) return -1; val = (val << 4) | v; }
+	}
+	else {
+		return -1;
+	}
+	return cheat_add(addr, (uint8)val);
+}
+
+void cheat_load(void){
+	int i;
+	cheat_clear();
+	if (!is_section_exists((sint8*)"Cheats"))
+		return;
+	for (i = 0; i < MAX_CHEATS; i++){
+		sint8 *line;
+		char   key[8];
+		int    k = i, n = 0, a, b;
+		if (k == 0){
+			key[n++] = '0';
+		} else {
+			while (k > 0){ key[n++] = (char)('0' + (k % 10)); k /= 10; }
+			for (a = 0, b = n - 1; a < b; a++, b--){ char t = key[a]; key[a] = key[b]; key[b] = t; }
+		}
+		key[n] = '\0';
+		line = get_config_string((sint8*)"Cheats", (sint8*)key, NULL);
+		if (line != NULL)
+			cheat_parse((const char*)line);
+	}
+}
+
+/* Apply cheats straight into the emulated memory map so the assembly CPU
+ * core (which bypasses mem_getbyte) also sees them. */
+void cheat_apply(void){
+	int i;
+	if (cheat_count == 0)
+		return;
+	for (i = 0; i < cheat_count; i++){
+		uint32 a, block, me;
+		uchar *m;
+		if (!cheats[i].enabled)
+			continue;
+		a     = cheats[i].addr & 0xFFFFFF;
+		block = (a >> 13) & 0x7FF;
+		m     = MAP[block];
+		me    = (uint32)m;
+		if (me < 0x80000000){
+			*(m + a) = cheats[i].value;      /* regular mapped memory (WRAM/ROM) */
+#ifdef ARM9
+			/* The cheat store bypasses mem_setbyte: flag the block so the
+			 * next fetch of patched code gets a range flush. */
+			mem_smc_mark_dirty(a);
+#endif
+		} else if (me == (uint32)MAP_LOROM_SRAM){
+			if (SNESC.SRAMMask) SNESC.SRAM[a & SNESC.SRAMMask] = cheats[i].value;
+		} else if (me == (uint32)MAP_HIROM_SRAM){
+			if (SNESC.SRAMMask) SNESC.SRAM[((a & 0x7fff) - 0x6000 + ((a & 0xf0000) >> 3)) & SNESC.SRAMMask] = cheats[i].value;
+		}
+	}
+}
 
 #if (defined(__GNUC__) && !defined(__clang__))
 __attribute__((optimize("O0")))
@@ -149,29 +333,25 @@ void InitLoROMMap(int mode)
 	
 	//SnemulDS 0.6d
 	romFname = (char*)&SNES.ROM_info.title[0];
-	
-	//1) 2MB or less LoROM Size: The bottom (32K x 64) blocks is mirrored, the next upper (32K x 64 pages) is mirrored as well. (Contiguous 2MB LoROM + mirrors)
-	if( SNES.ROMSize <= ((2*1024*1024) + (512*1024)) ){
-		LoROMMappedRange = 0x200000;
-		
-		//Fixes Megaman X2 lockups on NTR hardware
-		if ((strncmpi((char*)romFname, "MEGAMAN X2", 10) == 0) && (__dsimode == false)){
-			LoROMMappedRange = (8*1024*1024);
+	{
+		const s_game_hack *hack = GameHack_Find((char*)romFname, 0);
+
+		//1) 2MB or less LoROM Size: The bottom (32K x 64) blocks is mirrored, the next upper (32K x 64 pages) is mirrored as well. (Contiguous 2MB LoROM + mirrors)
+		if( SNES.ROMSize <= ((2*1024*1024) + (512*1024)) ){
+			LoROMMappedRange = 0x200000;
+
+			//Fixes Megaman X2 lockups on NTR hardware
+			if (hack && hack->loRom8M && (__dsimode == false)){
+				LoROMMappedRange = (8*1024*1024);
+			}
 		}
-	}
-	
-	//2) 3MB or higher LoROM Size: 
-	//The bottom (32K x 64) blocks is mirrored from the 1MB+ bottom half of the 3M+ LoROM. 
-	//The upper (32K x 64) blocks is mirrored from the 2MB upper half of the 3M+ LoROM.  (Non-contiguous 32K x 2 4MB LoROM)
-	else{
-		LoROMMappedRange = SNES.ROMSize;
-	}
-	
-	if(strncmpi((char*)romFname, "MEGAMAN X", 9) == 0){	//ROM masked as Read-Only, fixes Megaman X1,X2,X3 AP protection, thus making the game playable 100%	(2/2)
-		LoROM_Direct_ROM_Mapping = true;
-	}
-	else{
-		LoROM_Direct_ROM_Mapping = false;
+		else{
+			//2) 3MB or higher LoROM Size: (Non-contiguous 32K x 2 4MB LoROM)
+			LoROMMappedRange = SNES.ROMSize;
+		}
+
+		//ROM masked as Read-Only, fixes Megaman X1,X2,X3 AP protection (2/2)
+		LoROM_Direct_ROM_Mapping = (hack && hack->romMaskRO) ? true : false;
 	}
 		
 	if (mode == NOT_LARGE)
@@ -449,18 +629,27 @@ void mem_init_paging(char * filename, int size){
 		if (ROMheader != 0&& ROMheader != 512){
 			ROMheader = 512;
 		}
-		f_close(&fPagingFD);
+		FS_closePagingFD();
 		int flags = charPosixToFlagPosix("r");
 		BYTE mode = posixToFatfsAttrib(flags);
 		FRESULT result = f_open(&fPagingFD, (const TCHAR*)filename, mode);
-		//Prevent Cache problems.
-		f_lseek (
-				&fPagingFD,   /* Pointer to the file object structure */
-				(DWORD)0       /* File offset in unit of byte */
-			);
-		int ret;
-		result = f_read(&fPagingFD, SNES_ROM_ADDRESS, (int)PAGE_SIZE+ROMheader, (UINT*)&ret);
-		f_close(&fPagingFD);
+		if(result == FR_OK){
+			FS_markPagingFDOpened();
+			//Prevent Cache problems.
+			f_lseek (
+					&fPagingFD,   /* Pointer to the file object structure */
+					(DWORD)0       /* File offset in unit of byte */
+				);
+			int ret = 0;
+			result = f_read(&fPagingFD, SNES_ROM_ADDRESS, (int)PAGE_SIZE+ROMheader, (UINT*)&ret);
+			if (result != FR_OK || ret != (int)(PAGE_SIZE+ROMheader)){
+				printf("mem_init_paging: short read (%d of %d bytes)\n", ret, (int)(PAGE_SIZE+ROMheader));
+			}
+			FS_closePagingFD();
+		}
+		else{
+			printf("mem_init_paging: f_open failed for %s\n", filename);
+		}
 		load_ROM(SNES_ROM_ADDRESS, PAGE_SIZE+ROMheader);
 
 		int i = 20;
@@ -621,8 +810,7 @@ uint8 *	mem_checkReloadHiROM(int block){
 	ret = FS_loadROMPage((char*)ptr, SNES.ROMHeader+i*PAGE_SIZE, PAGE_SIZE);
 
 #ifdef ARM9
-	coherent_user_range_by_size((uint32)ptr, (int)PAGE_SIZE);	//Make coherent old page before destroy (could be being in cpu cache)
-
+	mem_cache_flush_range((void*)ptr, (uint32)PAGE_SIZE);	//Make coherent the freshly streamed page (range-restricted)
 #endif	
 	mem_setCacheBlock(i, ptr); // Give Read-only memory
 
@@ -671,7 +859,7 @@ uint8 *	mem_checkReloadLoROM(int blockInPage, int blockInROM)
 	ret = FS_loadROMPage((char*)ptr, (SNES.ROMHeader+ ((((blockInROM & 0x1FF)<<13)>>LoROM32kShift)<<LoROM32kShift) ), PAGE_LOROM); //((RomOffset * 8192) / 32K) * 32K
 
 	#ifdef ARM9
-	//coherent_user_range_by_size((uint32)ptr, (int)PAGE_LOROM);	//Make coherent new page
+	mem_cache_flush_range((void*)ptr, (uint32)PAGE_LOROM);	//Make coherent the freshly streamed LoROM page (range-restricted)
 	#endif
 
 	mem_setCacheBlock(i, ptr); // Give Read-only memory
@@ -930,6 +1118,13 @@ uchar mem_getbyte(uint16 offset,uchar bank)
 	int block;
 	uchar *addr;
 
+	if (cheat_count){
+		int ci;
+		for (ci = 0; ci < cheat_count; ci++)
+			if (cheats[ci].enabled && cheats[ci].addr == (uint32)address)
+				return cheats[ci].value;
+	}
+
 	block = (address>>13)&0x7FF;
 	addr = MAP[block];
 
@@ -951,6 +1146,13 @@ void mem_setbyte(uint16 offset, uchar bank, uchar byte)
 	int block;
 	uchar *addr;
 
+	if (cheat_count){
+		int ci;
+		for (ci = 0; ci < cheat_count; ci++)
+			if (cheats[ci].enabled && cheats[ci].addr == (uint32)address)
+				byte = cheats[ci].value;
+	}
+
 	block = (address>>13)&0x7FF;
 	addr = WMAP[block];
 	if ((u32)addr == (u32)MAP_PAGING){
@@ -959,6 +1161,11 @@ void mem_setbyte(uint16 offset, uchar bank, uchar byte)
 	
 	if (REGULAR_MAP(addr) ){ //if address is within indirect mapped memory define (snes.h), a forced (below) IO_xxxx opcode takes place
 		*(addr+address) = byte;
+#ifdef ARM9
+		/* Self-modifying code: remember that this 8KB block changed so the
+		 * cache range is flushed lazily, right before it is executed. */
+		mem_smc_mark_dirty((uint32)address);
+#endif
 	}
 	else{
 		IO_setbyte((int)addr, address, byte);
@@ -1003,19 +1210,17 @@ void mem_setword(uint16 offset, uchar bank, ushort word)
 	
 	if (REGULAR_MAP(addr)){ //if address is within indirect mapped memory define (snes.h), a forced (below) IO_xxxx opcode takes place
 		SET_WORD16(addr+address, word);
+#ifdef ARM9
+		mem_smc_mark_dirty((uint32)address);
+#endif
 	}
 	else{
 		IO_setword((int)addr, address, word);
 	}
 }
 
-#if (defined(__GNUC__) && !defined(__clang__))
-__attribute__((optimize("O0")))
-#endif
-
-#if (!defined(__GNUC__) && defined(__clang__))
-__attribute__ ((optnone))
-#endif
+/* Hot path (DMA/HDMA base resolution): keep the normal -Os pipeline rather
+ * than the forced -O0 used by the cold init helpers. */
 void *mem_getbaseaddress(uint16 offset, uchar bank)
 {
 	int block;
@@ -1029,7 +1234,14 @@ void *mem_getbaseaddress(uint16 offset, uchar bank)
 		ptr = mem_checkReload(block, bank, offset);
 	}
 	if (REGULAR_MAP(ptr))
+	{
+#ifdef ARM9
+		/* Conditional SMC invalidation: if this 8KB block was written since it
+		 * was last executed, flush exactly that block's cache range. */
+		mem_smc_flush_block(block, (void*)((uint32)ptr + (block << 13)));
+#endif
 		return ptr+(bank<<16);
+	}
 
 	switch ((int)ptr)
 	{
@@ -1046,13 +1258,7 @@ void *mem_getbaseaddress(uint16 offset, uchar bank)
 	}
 }
 
-#if (defined(__GNUC__) && !defined(__clang__))
-__attribute__((optimize("O0")))
-#endif
-
-#if (!defined(__GNUC__) && defined(__clang__))
-__attribute__ ((optnone))
-#endif
+/* Hot path (DMA/HDMA source resolution): keep the normal -Os pipeline. */
 void *map_memory(uint16 offset, uchar bank)
 {
 	int block;
@@ -1067,7 +1273,13 @@ void *map_memory(uint16 offset, uchar bank)
 	}
 
 	if (REGULAR_MAP(ptr))
+	{
+#ifdef ARM9
+		/* Conditional SMC invalidation on code fetch / control transfer. */
+		mem_smc_flush_block(block, (void*)((uint32)ptr + (block << 13)));
+#endif
 		return ptr+address;
+	}
 
 	switch ((int)ptr)
 	{

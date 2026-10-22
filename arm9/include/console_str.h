@@ -88,6 +88,8 @@ GNU General Public License for more details.
 
 #define IDS_GBA_MACRO_MODE		111
 
+#define IDS_BILINEAR		112
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -112,6 +114,8 @@ extern void PPU_ChangeLayerConf(int i);
 extern void saveOptionsToConfig(sint8 *section);
 extern void	APU_clear();
 extern void GUI_setLanguage(int lang);
+
+extern const char *LayerPresetNames[10];
 
 
 #ifdef __cplusplus

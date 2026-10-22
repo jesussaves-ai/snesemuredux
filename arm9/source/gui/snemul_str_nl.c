@@ -119,4 +119,5 @@ sint8*  g_snemulds_str_nl[] =
 	"Config ",				/* 109 */	
 	"Reset now ",				/* 110 */
 	"GBA Macro Mode",				/* 111 */
+		"Bilineair",			/* 112 */
 };

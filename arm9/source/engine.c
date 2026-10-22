@@ -124,10 +124,17 @@ bool	changeROM(char *ROM, int size){
   
   CFG.TilePriorityBG = -1; CFG.Debug2 = 0;
   
+  // Auto-enable the dedicated Mode 0 renderer (4x 2bpp BG layers). Mode 0 has
+  // no valid DS fallback, so every game that uses it is routed here.
+  CFG.Mode0Fix = 1;
+  
   CFG.SpritePr[0] = 3;
   CFG.SpritePr[1] = 2;
   CFG.SpritePr[2] = 1;
   CFG.SpritePr[3] = 1;
+  
+  // (Re)load the [Cheats] section of snemul.cfg for this game.
+  cheat_load();
   
   #ifdef IN_EMULATOR
   CFG.Sound_output = 0;
@@ -358,6 +365,7 @@ int go()
       if (!CPU.NMIActive) DMA_PORT[0x10] |= 0x80;
       SNES.v_blank = 1; CPU.NMIActive = 0;
       update_joypads();
+      cheat_apply();	// re-apply active cheats into the emulated memory map
       SNES.DelayedNMI = 0;
 	}
    }

@@ -180,7 +180,7 @@ m1x1Decoder:
 @ First bank for DP addressing
 @-------------------------------------------------------------------
 DPCache:
-    .rept   16
+    .rept   32
     .long   0
     .endr
 
@@ -941,7 +941,7 @@ CPU_update:
 	@  DP Cache
     ldr     r1, =DPCache
     ldr     r2, =MemoryMap
-    mov     r3, #0x10
+    mov     r3, #0x20
 DPCacheLoop:
     ldr     r0, [r2], #4
 	str     r0, [r1], #4

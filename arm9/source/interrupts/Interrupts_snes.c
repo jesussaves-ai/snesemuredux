@@ -58,7 +58,9 @@ void Timer3handlerUser(){
 __attribute__((section(".itcm")))
 #endif
 void HblankUser(){
-	SNEMULDS_IPC->APU_ADDR_CMD = 0xFFFFFFFF;
+	struct sIPCSharedTGDSSpecific* ipc = SNEMULDS_IPC;
+
+	ipc->APU_ADDR_CMD = 0xFFFFFFFF;
 
 	if (REG_VCOUNT >= 192)
 	{
@@ -74,9 +76,7 @@ void HblankUser(){
 
 	//	h_blank=1;
 	end:
-	SNEMULDS_IPC->APU_ADDR_CMD = 0;
-	
-    //GUI_printf("hblank! \n");	
+	ipc->APU_ADDR_CMD = 0;
 }
 
 #ifdef ARM9
